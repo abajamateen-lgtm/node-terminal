@@ -11,7 +11,19 @@
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { background-color: var(--bg-color); color: var(--text-color); font-family: -apple-system, BlinkMacSystemFont, sans-serif; height: 100vh; display: flex; justify-content: center; align-items: center; }
         .auth-container { width: 85%; max-width: 300px; text-align: center; }
-        .logo { width: 40px; margin-bottom: 30px; border-radius: 8px; }
+        
+        /* New Text-Based Logo Styling */
+        .logo-text {
+            font-size: 32px;
+            font-weight: 800;
+            letter-spacing: -1px;
+            margin-bottom: 30px;
+            text-transform: uppercase;
+            background: linear-gradient(45deg, #ffffff, #888888);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
         #errorMessage { color: var(--error-red); font-size: 12px; margin-bottom: 15px; display: none; text-align: left; background: rgba(255, 77, 77, 0.1); padding: 10px; border-radius: 8px; }
         .ghost-input { width: 100%; background: var(--input-bg); border: 1px solid var(--charcoal); border-radius: 12px; padding: 16px; color: var(--text-color); margin-bottom: 12px; outline: none; transition: border 0.3s; }
         .ghost-input:focus { border-color: #555; }
@@ -25,7 +37,7 @@
 </head>
 <body>
     <div class="auth-container">
-        <img src="nodelogo.jpg" alt="Node" class="logo">
+        <div class="logo-text">Node</div>
         
         <div id="errorMessage"></div> 
 
