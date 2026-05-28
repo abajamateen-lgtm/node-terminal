@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Explore | Node</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        :root { 
+            --bg: #000; --charcoal: #121212; --border: #2f3336; 
+            --text-dim: #71767b; --accent: #fff; --green: #00ba7c; 
+            --red: #f91880; --blue: #1d9bf0;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: var(--bg); color: #fff; font-family: -apple-system, sans-serif; overflow: hidden; }
+
+        header { border-bottom: 1px solid var(--border); padding: 15px 15px 0 15px; background: #000; position: sticky; top: 0; z-index: 10; }
+        .header-top { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+        .search-wrapper { background: #202327; border-radius: 20px; display: flex; align-items: center; padding: 10px 15px; flex: 1; border: 1px solid transparent; }
+        .search-wrapper:focus-within { border-color: var(--blue); background: #000; }
+        .search-input { background: none; border: none; color: #fff; width: 100%; margin-left: 10px; outline: none; font-size: 15px; }
+        
+        .tabs { display: flex; margin-top: 5px; }
+        .tab { flex: 1; text-align: center; padding: 15px; font-size: 15px; font-weight: 600; color: var(--text-dim); cursor: pointer; position: relative; }
+        .tab.active { color: #fff; }
+        .tab.active::after { content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); width: 40px; height: 4px; background: var(--blue); border-radius: 10px; }
+
+        .results-container { height: calc(100vh - 120px); overflow-y: auto; padding-bottom: 100px; }
+        .user-row { display: flex; align-items: center; padding: 12px 15px; cursor: pointer; border-bottom: 1px solid var(--border); transition: 0.2s; }
+        .user-row:hover { background: #080808; }
+        .avatar { width: 45px; height: 45px; border-radius: 50%; border: 1px solid var(--border); margin-right: 12px; object-fit: cover; background: #111; }
+        .u-name { font-weight: 700; font-size: 15px; display: block; }
+        .u-handle { color: var(--text-dim); font-size: 14px; }
+
+        /* Modals & Overlays */
+        #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: none; z-index: 1100; }
+        #overlay.active { display: block; }
+
+        #comment-modal { 
+            display: none; position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); 
+            width: 100%; max-width: 600px; height: 85vh; background: #000; z-index: 1200; 
+            border-top-left-radius: 20px; border-top-right-radius: 20px; border: 1px solid var(--border); 
+        }
+        #comment-modal.active { display: block; }
+        
+        .modal-header { padding: 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+        .comments-list { padding: 20px; overflow-y: auto; height: calc(85vh - 130px); padding-bottom: 100px; }
+        
+        .input-container { position: absolute; bottom: 0; width: 100%; padding: 15px; background: #000; border-top: 1px solid var(--border); display: flex; gap: 10px; align-items: center; }
+        #comment-input { flex: 1; padding: 12px; border-radius: 25px; border: none; background: #1c1c1c; color: white; outline: none; }
+
+        /* Profile Overlay */
+        #profileOverlay { position: fixed; inset: 0; background: #000; z-index: 1000; transform: translateX(100%); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); display: flex; flex-direction: column; }
+        #profileOverlay.open { transform: translateX(0); }
+        .overlay-header { padding: 10px 15px; display: flex; align-items: center; gap: 30px; border-bottom: 1px solid var(--border); background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); }
+        
+        .profile-content { flex: 1; overflow-y: auto; padding-bottom: 50px; }
+        .profile-hero { padding: 20px 15px; text-align: left; border-bottom: 1px solid var(--border); }
+        .avatar-large { width: 80px; height: 80px; border-radius: 50%; border: 3px solid #000; margin-bottom: 10px; object-fit: cover; background: #111; }
+        
+        .stats-bar { display: flex; gap: 20px; margin: 15px 0; font-size: 14px; }
+        .stat-num { font-weight: 800; color: #fff; }
+        .stat-label { color: var(--text-dim); }
+
+        .btn-follow { background: #fff; color: #000; border: none; padding: 8px 20px; border-radius: 20px; font-weight: 700; cursor: pointer; float: right; }
+        .btn-follow.following { background: transparent; color: #fff; border: 1px solid var(--border); }
+
+        /* Post Card Styling */
+        .post-card { padding: 15px; border-bottom: 1px solid var(--border); }
+        .post-img { width: 100%; border-radius: 12px; margin-top: 10px; border: 1px solid var(--border); max-height: 500px; object-fit: cover; display: block; }
+        .icon { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; vertical-align: middle; }
+        .action-row { display: flex; justify-content: space-between; max-width: 300px; margin-top: 12px; color: var(--text-dim); }
+        .action-item { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; transition: 0.2s; }
+        
+        /* Interaction States */
+        .action-item.liked { color: var(--red); }
+        .action-item.liked svg { fill: var(--red); stroke: var(--red); }
+        .action-item.reposted { color: var(--green); }
+        
+        .back-btn { background: none; border: none; color: #fff; cursor: pointer; display: flex; align-items: center; }
+    </style>
+</head>
+<body>
+
+    <div id="overlay" onclick="closeAllModals()"></div>
+
+    <div id="comment-modal">
+        <div class="modal-header">
+            <span style="font-weight:bold;">Thread Matrix</span>
+            <button onclick="closeAllModals()" style="background:none; border:none; color:white; font-size:20px; cursor:pointer;">✕</button>
+        </div>
+        <div id="comments-list" class="comments-list"></div>
+        <div class="input-container">
+            <input type="text" id="comment-input" placeholder="Post your reply" />
+            <button id="post-comment-btn" onclick="handleCommentSubmission()" style="background:none; border:none; color:var(--blue); font-weight:bold; cursor:pointer;">Post</button>
+        </div>
+    </div>
+
+    <header>
+        <div class="header-top">
+            <button class="back-btn" onclick="window.location.href='home.html'"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+            <div class="search-wrapper">
+                <input type="text" id="searchInput" class="search-input" placeholder="Search Node..." oninput="triggerSearch()">
+            </div>
+        </div>
+        <div class="tabs">
+            <div class="tab active" id="tab-profiles" onclick="switchTab('profiles')">Profiles</div>
+            <div class="tab" id="tab-posts" onclick="switchTab('posts')">Posts</div>
+        </div>
+    </header>
+
+    <main class="results-container" id="resultsList"></main>
+
+    <div id="profileOverlay">
+        <div class="overlay-header">
+            <button class="back-btn" onclick="closeProfile()"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+            <div>
+                <div id="overlayUsername" style="font-weight: 800; font-size: 18px;"></div>
+                <div id="overlayPostCount" style="font-size: 12px; color: var(--text-dim);">0 posts</div>
+            </div>
+        </div>
+        
+        <div class="profile-content">
+            <div class="profile-hero">
+                <button class="btn-follow" id="followBtn" onclick="toggleFollow()">Follow</button>
+                <img id="viewAvatar" class="avatar-large" src="">
+                <h2 id="viewName"></h2>
+                <p id="viewHandle" style="color: var(--text-dim);"></p>
+                <p id="viewBio" style="margin-top: 12px; font-size: 15px;"></p>
+                
+                <div class="stats-bar">
+                    <div><span class="stat-num" id="countFollowing">0</span> <span class="stat-label">Following</span></div>
+                    <div><span class="stat-num" id="countFollowers">0</span> <span class="stat-label">Followers</span></div>
+                </div>
+            </div>
+            
+            <div id="viewFeed"></div>
+        </div>
+    </div>
+
+    <script src="search.js"></script>
+    <script src="algorithm.js"></script>
+</body>
+</html>
