@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Node - Edit Profile</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        :root {
+            --bg: #000;
+            --text: #fff;
+            --charcoal: #111;
+            --border: #222;
+            --accent-blue: #1d9bf0;
+            --dim: #71767b;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: var(--bg); color: var(--text); font-family: -apple-system, sans-serif; height: 100vh; }
+
+        header {
+            display: flex; align-items: center; justify-content: space-between;
+            padding: 15px 20px; border-bottom: 1px solid var(--border);
+            position: sticky; top: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px); z-index: 100;
+        }
+        .back-btn { background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; }
+        .save-btn { background: #fff; color: #000; border: none; padding: 6px 16px; border-radius: 20px; font-weight: bold; cursor: pointer; }
+
+        .form-container { max-width: 600px; margin: 0 auto; padding: 20px; }
+        
+        .pic-section { display: flex; flex-direction: column; align-items: center; margin-bottom: 30px; }
+        .avatar-preview { 
+            width: 120px; height: 120px; border-radius: 50%; 
+            background: var(--charcoal); object-fit: cover; 
+            border: 3px solid var(--accent-blue); margin-bottom: 15px;
+            transition: all 0.3s ease;
+        }
+
+        .random-btn {
+            background: var(--charcoal); color: #fff; border: 1px solid var(--border);
+            padding: 12px 24px; border-radius: 30px; font-size: 14px; font-weight: 600;
+            cursor: pointer;
+        }
+
+        .input-group { margin-bottom: 25px; }
+        .input-group label { display: block; color: var(--dim); font-size: 13px; margin-bottom: 8px; }
+        .input-group input, .input-group textarea {
+            width: 100%; background: none; border: 1px solid var(--border);
+            padding: 14px; border-radius: 12px; color: #fff; font-size: 16px; outline: none;
+        }
+        .input-group input:focus { border-color: var(--accent-blue); }
+        textarea { height: 100px; resize: none; }
+
+        #status-msg { text-align: center; font-size: 14px; margin-bottom: 20px; padding: 10px; border-radius: 8px; display: none; }
+    </style>
+</head>
+<body>
+
+    <header>
+        <button class="back-btn" onclick="window.history.back()">✕</button>
+        <h2 style="font-size:18px; font-weight: 800;">Edit Profile</h2>
+        <button class="save-btn" id="save-master-btn" onclick="saveProfile()">Save</button>
+    </header>
+
+    <div class="form-container">
+        <div id="status-msg"></div>
+
+        <div class="pic-section">
+            <img src="" id="pfp-preview" class="avatar-preview" onerror="this.src='https://api.dicebear.com/7.x/pixel-art/svg?seed=fallback'">
+            <button class="random-btn" onclick="randomizeAvatar()">Generate Pixel Design</button>
+        </div>
+
+        <div class="input-group">
+            <label>Name</label>
+            <input type="text" id="edit-name" placeholder="Name">
+        </div>
+
+        <div class="input-group">
+            <label>Username</label>
+            <input type="text" id="edit-username" placeholder="@username">
+        </div>
+
+        <div class="input-group">
+            <label>Bio</label>
+            <textarea id="edit-bio" placeholder="Update your status"></textarea>
+        </div>
+    </div>
+
+    <script>
+        const vClient = supabase.createClient('https://ivrztuodamhbgbuwwesg.supabase.co', 'sb_publishable__LtZr-fkLALBDibnIFImnA_9dU17BOp');
+
+        const PIXEL_API = "https://api.dicebear.com/7.x/pixel-art/svg?seed=";
+
+        function randomizeAvatar() {
+            const seed = Math.random().toString(36).substring(7);
+            const newUrl = PIXEL_API + seed;
+            document.getElementById('pfp-preview').src = newUrl;
+        }
+
+        async function loadProfile() {
+            const { data: { user } } = await vClient.auth.getUser();
+            if (!user) return;
+
+            const { data: profile } = await vClient.from('profiles').select('*').eq('id', user.id).single();
+
+            if (profile) {
+                document.getElementById('edit-name').value = profile.full_name || '';
+                document.getElementById('edit-username').value = profile.username || '';
+                document.getElementById('edit-bio').value = profile.bio || '';
+                document.getElementById('pfp-preview').src = profile.avatar_url || (PIXEL_API + 'default');
+            }
+        }
+
+        async function saveProfile() {
+            const btn = document.getElementById('save-master-btn');
+            const status = document.getElementById('status-msg');
+            
+            btn.disabled = true;
+            status.style.display = "block";
+            status.style.background = "#1d9bf01a";
+            status.style.color = "var(--accent-blue)";
+            status.innerText = "Syncing with Node...";
+
+            const { data: { user } } = await vClient.auth.getUser();
+
+            const updates = {
+                id: user.id,
+                full_name: document.getElementById('edit-name').value,
+                username: document.getElementById('edit-username').value,
+                bio: document.getElementById('edit-bio').value,
+                avatar_url: document.getElementById('pfp-preview').src
+                // Removed updated_at to prevent the schema error
+            };
+
+            const { error } = await vClient.from('profiles').upsert(updates);
+
+            if (error) {
+                status.style.background = "#f918801a";
+                status.style.color = "#f91880";
+                status.innerText = "Error: " + error.message;
+                btn.disabled = false;
+            } else {
+                status.style.background = "#00ba7c1a";
+                status.style.color = "#00ba7c";
+                status.innerText = "Profile Saved!";
+                setTimeout(() => window.location.href = 'profile.html', 1000);
+            }
+        }
+
+        document.addEventListener('DOMContentLoaded', loadProfile);
+    </script>
+</body>
+</html>
