@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Velvet - Profile</title>
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+    <style>
+        :root {
+            --bg-color: #000000;
+            --text-main: #ffffff;
+            --text-dim: #71767b;
+            --accent-green: #00ba7c;
+            --accent-blue: #1d9bf0;
+            --accent-red: #f91880;
+            --yellow-color: #ffcc00;
+            --border: #2f3336;
+        }
+        * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: var(--bg-color); color: var(--text-main); margin: 0; overflow-x: hidden; }
+
+        header { 
+            padding: 10px 15px; display: flex; align-items: center; height: 60px;
+            position: sticky; top: 0; background: rgba(0,0,0,0.8); backdrop-filter: blur(10px);
+            border-bottom: 1px solid var(--border); z-index: 10;
+        }
+        .back-btn { font-size: 24px; cursor: pointer; margin-right: 30px; text-decoration: none; color: white; }
+        .header-info h2 { margin: 0; font-size: 18px; }
+        .post-count { font-size: 12px; color: var(--text-dim); }
+
+        .cover-photo { height: 130px; background: linear-gradient(to bottom, #1d9bf033, #000); }
+        .profile-hero { padding: 0 15px; margin-top: -45px; position: relative; }
+        .avatar { width: 90px; height: 90px; border-radius: 50%; background: #333; border: 4px solid #000; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+        .avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+        .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; height: 36px; }
+        .btn-action { background: var(--accent-blue); color: white; border: none; padding: 0 16px; border-radius: 20px; font-weight: 700; font-size: 14px; cursor: pointer; display: flex; align-items: center; text-decoration: none; }
+        .btn-secondary { background: transparent; border: 1px solid var(--border); }
+
+        .bio-section { margin-top: 15px; }
+        .username { font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 4px; }
+        .verify-badge { width: 20px; height: 20px; fill: var(--accent-blue); display: none; }
+        .handle { color: var(--text-dim); margin-bottom: 12px; font-size: 15px; }
+        .bio-text { font-size: 15px; line-height: 1.4; margin: 10px 0; color: #eee; }
+        .stats { display: flex; gap: 20px; font-size: 14px; }
+        .stat-item { color: var(--text-dim); text-decoration: none; cursor: pointer; }
+        .stat-item span { font-weight: 700; color: white; }
+
+        .tabs { display: flex; border-bottom: 1px solid var(--border); margin-top: 20px; }
+        .tab { flex: 1; text-align: center; padding: 15px; font-size: 14px; font-weight: 700; color: var(--text-main); border-bottom: 2px solid var(--accent-blue); }
+
+        #profile-feed { padding-bottom: 100px; }
+        .post-card { border-bottom: 1px solid var(--border); padding: 15px; }
+        .post-img { width: 100%; border-radius: 15px; border: 1px solid var(--border); margin-top: 10px; }
+        
+        .post-actions { display: flex; justify-content: space-between; color: var(--text-dim); margin-top: 15px; max-width: 400px; }
+        .action-item { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 13px; }
+        svg.icon { stroke: var(--text-dim); fill: none; stroke-width: 1.5; width: 19px; height: 19px; }
+        
+        /* THE CRITICAL CSS TO KEEP HEARTS RED */
+        .action-item.liked svg { fill: var(--accent-red) !important; stroke: var(--accent-red) !important; }
+        .action-item.saved svg { fill: var(--yellow-color) !important; stroke: var(--yellow-color) !important; }
+
+        #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: none; z-index: 110; }
+        #overlay.active { display: block; }
+        #comment-modal { 
+            display: none; position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); 
+            width: 100%; max-width: 600px; height: 85vh; background: #000; z-index: 200; 
+            border-top-left-radius: 20px; border-top-right-radius: 20px; border: 1px solid var(--border); 
+        }
+        #comment-modal.active { display: block; }
+        .input-container { position: absolute; bottom: 0; width: 100%; padding: 15px; background: #000; border-top: 1px solid var(--border); display: flex; gap: 10px; }
+        #comment-input { flex: 1; padding: 12px; border-radius: 25px; border: none; background: #1c1c1c; color: white; outline: none; }
+
+        .owner-controls { display: flex; gap: 10px; margin-top: 15px; padding-top: 10px; border-top: 1px solid #16181c; }
+        .btn-owner { flex: 1; padding: 8px; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; text-align: center; text-decoration: none; }
+        .btn-boost { background: #1d9bf01a; color: var(--accent-blue); border: 1px solid var(--accent-blue); }
+        .btn-stats { background: #00ba7c1a; color: var(--accent-green); border: 1px solid var(--accent-green); }
+
+        .fab-create { position: fixed; bottom: 30px; right: 20px; width: 56px; height: 56px; border-radius: 50%; background: #ffffff; color: #000; display: flex; align-items: center; justify-content: center; text-decoration: none; font-size: 30px; z-index: 99; }
+    </style>
+</head>
+<body>
+
+    <div id="overlay" onclick="closeAllModals()"></div>
+
+    <div id="comment-modal">
+        <div style="padding: 20px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border);">
+            <span style="font-weight:bold;">Thread Matrix</span>
+            <button onclick="closeAllModals()" style="background:none; border:none; color:white; font-size:20px; cursor:pointer;">✕</button>
+        </div>
+        <div id="comments-list" style="padding: 20px; overflow-y: auto; height: calc(85vh - 130px); padding-bottom: 100px;"></div>
+        <div class="input-container">
+            <input type="text" id="comment-input" placeholder="Post your reply" />
+            <button onclick="handleCommentSubmission()" style="background:none; border:none; color:var(--accent-blue); font-weight:bold; cursor:pointer;">Post</button>
+        </div>
+    </div>
+
+    <header>
+        <a href="home.html" class="back-btn">←</a>
+        <div class="header-info">
+            <h2 id="headerName">Profile</h2>
+            <div class="post-count" id="headerPostCount">0 posts</div>
+        </div>
+    </header>
+
+    <div class="cover-photo"></div>
+    
+    <div class="profile-hero">
+        <div class="avatar">
+            <img src="https://abs.twimg.com/sticky/default_profile_images/default_profile_400x400.png" id="pfpImg">
+        </div>
+        <div class="actions"></div>
+        
+        <div class="bio-section">
+            <div class="username">
+                <span id="profileName">User</span>
+                <svg id="badge" class="verify-badge" viewBox="0 0 24 24"><path d="M22.5 12.5L20.8 10.7L21 8.2L18.6 7.7L17.3 5.5L15 6.5L12.8 4.7L10.5 6.5L8.2 5.5L6.9 7.7L4.5 8.2L4.7 10.7L3 12.5L4.7 14.3L4.5 16.8L6.9 17.3L8.2 19.5L10.5 18.5L12.8 20.3L15 18.5L17.3 19.5L18.6 17.3L21 16.8L20.8 14.3L22.5 12.5ZM10.5 15.5L7.5 12.5L8.9 11.1L10.5 12.7L14.6 8.6L16 10L10.5 15.5Z"></path></svg>
+            </div>
+            <div class="handle" id="profileHandle">@loading...</div>
+            <p class="bio-text" id="profileBio">Loading...</p>
+            <div class="stats">
+                <div class="stat-item"><span id="postCountStat">0</span> <span>Posts</span></div>
+                <div class="stat-item"><span id="followingCount">0</span> <span>Following</span></div>
+                <div class="stat-item"><span id="followersCount">0</span> <span>Followers</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div class="tabs"><div class="tab">Posts</div></div>
+    <div id="profile-feed"></div>
+    <a href="create.html" class="fab-create">+</a>
+
+    <script>
+        const vClient = supabase.createClient('https://ivrztuodamhbgbuwwesg.supabase.co', 'sb_publishable__LtZr-fkLALBDibnIFImnA_9dU17BOp');
+        let myId = null;
+        let activePostId = null;
+        const viewedPosts = new Set();
+
+        async function initProfile() {
+            try {
+                const { data: { user: me } } = await vClient.auth.getUser();
+                if (!me) { window.location.href = 'index.html'; return; }
+                myId = me.id;
+
+                const params = new URLSearchParams(window.location.search);
+                const targetUserId = params.get('id') || me.id; 
+                const isMyProfile = (targetUserId === me.id);
+
+                const { data: profile } = await vClient.from('profiles').select('*').eq('id', targetUserId).single();
+
+                if (profile) {
+                    document.getElementById('headerName').innerText = profile.username;
+                    document.getElementById('profileName').innerText = profile.username;
+                    document.getElementById('profileHandle').innerText = `@${profile.username}`;
+                    document.getElementById('profileBio').innerText = profile.bio || "No bio yet.";
+                    if (profile.avatar_url) document.getElementById('pfpImg').src = profile.avatar_url;
+                    if (profile.is_verified) document.getElementById('badge').style.display = 'block';
+                }
+
+                const { count: followersCount } = await vClient.from('followers').select('*', { count: 'exact', head: true }).eq('following_id', targetUserId);
+                const { count: followingCount } = await vClient.from('followers').select('*', { count: 'exact', head: true }).eq('follower_id', targetUserId);
+                document.getElementById('followersCount').innerText = followersCount || 0;
+                document.getElementById('followingCount').innerText = followingCount || 0;
+
+                const actionArea = document.querySelector('.actions');
+                if (isMyProfile) {
+                    actionArea.innerHTML = `
+                        <a href="upgrade.html" class="btn-action" id="verifyBtn" style="${profile?.is_verified ? 'display:none' : ''}">Get Verified</a>
+                        <button class="btn-action btn-secondary" onclick="window.location.href='edit-profile.html'">Edit profile</button>
+                    `;
+                } else {
+                    const { data: followStatus } = await vClient.from('followers').select('*').eq('follower_id', me.id).eq('following_id', targetUserId).single();
+                    actionArea.innerHTML = `<button id="followBtn" class="btn-action ${followStatus ? 'btn-secondary' : ''}" onclick="toggleFollow('${targetUserId}')">${followStatus ? 'Following' : 'Follow'}</button>`;
+                }
+
+                // FIX: GET LIKED AND SAVED IDS SO THEY DON'T RESET TO ZERO
+                const { data: myLikes } = await vClient.from('likes').select('post_id').eq('user_id', myId);
+                const { data: mySaves } = await vClient.from('saved_posts').select('post_id').eq('user_id', myId);
+                const likedSet = new Set(myLikes?.map(l => l.post_id));
+                const savedSet = new Set(mySaves?.map(s => s.post_id));
+
+                const { data: posts } = await vClient.from('posts').select('*').eq('user_id', targetUserId).order('created_at', { ascending: false });
+                const feed = document.getElementById('profile-feed');
+                const pCount = posts ? posts.length : 0;
+                document.getElementById('headerPostCount').innerText = `${pCount} posts`;
+                document.getElementById('postCountStat').innerText = pCount;
+                
+                if (!posts || posts.length === 0) {
+                    feed.innerHTML = '<p style="text-align:center; color:var(--text-dim); margin-top:40px;">No posts yet.</p>';
+                } else {
+                    // PASS THE SETS TO THE RENDER FUNCTION
+                    feed.innerHTML = posts.map(post => renderPost(post, isMyProfile, likedSet.has(post.id), savedSet.has(post.id))).join('');
+                    setupViewObserver();
+                }
+
+            } catch (err) { console.error("Profile Init Error:", err); }
+        }
+
+        // FIX: RENDER POST NOW ACCEPTS LIKED/SAVED STATUS
+        function renderPost(p, isMyProfile, isLiked, isSaved) {
+            return `
+                <div class="post-card" data-id="${p.id}">
+                    <div class="post-content">${p.content}</div>
+                    ${p.image_url ? `<img src="${p.image_url}" class="post-img">` : ''}
+                    
+                    <div class="post-actions">
+                        <div class="action-item" onclick="openComments('${p.id}')">
+                            <svg class="icon" viewBox="0 0 24 24"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 1 1-7.6-11.7c.9 0 1.8.17 2.6.5L21 3z"></path></svg>
+                        </div>
+                        <div class="action-item ${isLiked ? 'liked' : ''}" onclick="toggleLike(this, '${p.id}')">
+                            <svg class="icon" viewBox="0 0 24 24"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>
+                            <span class="counter-val">${p.like_count || 0}</span>
+                        </div>
+                        <div class="action-item">
+                            <svg class="icon" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                            <span class="counter-val" id="view-count-${p.id}">${p.view_count || 0}</span>
+                        </div>
+                        <div class="action-item ${isSaved ? 'saved' : ''}" onclick="toggleSave(this, '${p.id}')">
+                            <svg class="icon" viewBox="0 0 24 24"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"></path></svg>
+                        </div>
+                    </div>
+
+                    ${isMyProfile ? `
+                    <div class="owner-controls">
+                        <a href="boostpost.html?id=${p.id}" class="btn-owner btn-boost">Boost Post</a>
+                        <a href="analytics.html?id=${p.id}" class="btn-owner btn-stats">Analytics</a>
+                    </div>` : ''}
+                </div>
+            `;
+        }
+
+        async function toggleLike(el, postId) {
+            const isLiked = el.classList.toggle('liked');
+            const span = el.querySelector('.counter-val');
+            let count = parseInt(span.innerText);
+            span.innerText = isLiked ? count + 1 : Math.max(0, count - 1);
+            
+            // PERSIST THE LIKE IN THE LIKES TABLE TOO
+            if (isLiked) await vClient.from('likes').insert([{ user_id: myId, post_id: postId }]);
+            else await vClient.from('likes').delete().eq('user_id', myId).eq('post_id', postId);
+            
+            await vClient.rpc(isLiked ? 'increment_likes' : 'decrement_likes', { post_id: postId });
+        }
+
+        async function toggleSave(el, postId) {
+            const isSaved = el.classList.toggle('saved');
+            if (isSaved) await vClient.from('saved_posts').insert([{ user_id: myId, post_id: postId }]);
+            else await vClient.from('saved_posts').delete().eq('user_id', myId).eq('post_id', postId);
+        }
+
+        function setupViewObserver() {
+            const observer = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        const postId = entry.target.getAttribute('data-id');
+                        if (!viewedPosts.has(postId)) {
+                            setTimeout(async () => {
+                                if (entry.isIntersecting && !viewedPosts.has(postId)) {
+                                    viewedPosts.add(postId);
+                                    const vSpan = document.getElementById(`view-count-${postId}`);
+                                    if (vSpan) vSpan.innerText = parseInt(vSpan.innerText) + 1;
+                                    await vClient.rpc('increment_views', { post_id: postId });
+                                }
+                            }, 2000);
+                        }
+                    }
+                });
+            }, { threshold: 0.8 });
+            document.querySelectorAll('.post-card').forEach(post => observer.observe(post));
+        }
+
+        window.openComments = async function(postId) {
+            activePostId = postId;
+            document.getElementById('comment-modal').classList.add('active');
+            document.getElementById('overlay').classList.add('active');
+            loadComments(postId);
+        };
+
+        async function loadComments(postId) {
+            const list = document.getElementById('comments-list');
+            list.innerHTML = '<p style="text-align:center; color:#888;">Tracing replies...</p>';
+            const { data } = await vClient.from('comments').select('*, profiles(username, avatar_url)').eq('post_id', postId).order('created_at', { ascending: true });
+            if (!data || data.length === 0) {
+                list.innerHTML = '<p style="text-align:center; color:#888; margin-top:40px;">No replies yet.</p>';
+            } else {
+                list.innerHTML = data.map(c => `
+                    <div style="margin-bottom:20px; display:flex; gap:12px;">
+                        <img src="${c.profiles?.avatar_url || 'https://abs.twimg.com/sticky/default_profile_images/default_profile_400x400.png'}" style="width:34px; height:34px; border-radius:50%;">
+                        <div><span style="font-weight:bold; font-size:14px;">@${c.profiles?.username}</span><p style="font-size:14px; color:#efefef;">${c.content}</p></div>
+                    </div>
+                `).join('');
+            }
+        }
+
+        window.handleCommentSubmission = async function() {
+            const input = document.getElementById('comment-input');
+            if (!input.value.trim()) return;
+            await vClient.from('comments').insert([{ post_id: activePostId, user_id: myId, content: input.value.trim() }]);
+            input.value = ''; loadComments(activePostId);
+        };
+
+        async function toggleFollow(targetId) {
+            const btn = document.getElementById('followBtn');
+            const isFollowing = btn.innerText === 'Following';
+            if (isFollowing) {
+                await vClient.from('followers').delete().eq('follower_id', myId).eq('following_id', targetId);
+            } else {
+                await vClient.from('followers').insert([{ follower_id: myId, following_id: targetId }]);
+            }
+            initProfile();
+        }
+
+        window.closeAllModals = () => {
+            document.getElementById('comment-modal').classList.remove('active');
+            document.getElementById('overlay').classList.remove('active');
+        };
+
+            window.onload = initProfile;
+    </script>
+</body>
+</html>
