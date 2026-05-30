@@ -1,4 +1,4 @@
-name: Build Android App
+ name: Build Android App
 
 on:
   push:
@@ -17,9 +17,12 @@ jobs:
       with:
         node-version: 18
 
+    - name: Initialize Project Package
+      run: |
+        echo '{"name": "node-terminal", "version": "1.0.0", "dependencies": {}, "devDependencies": {}}' > package.json
+
     - name: Install Mobile Wrapper (Capacitor)
       run: |
-        npm init -y
         npm install @capacitor/core @capacitor/cli
         npx cap init "Node Terminal" "com.nodeterminal.app" --web-dir=.
         npx cap add android
