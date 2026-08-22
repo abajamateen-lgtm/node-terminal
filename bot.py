@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 from typing import Optional, Dict, Any
 import aiohttp
+from aiohttp import web
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
@@ -49,9 +51,6 @@ class BuyTrackerBot:
         self.last_volume_m5: Optional[float] = None
 
     async def fetch_pair_data(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        """
-        Fetches pair stats from DexScreener API with exponential backoff for rate-limits.
-        """
         backoff = INITIAL_BACKOFF
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -82,9 +81,6 @@ class BuyTrackerBot:
         return None
 
     def format_alert_message(self, pair: Dict[str, Any], buy_amount_usd: float) -> str:
-        """
-        Formats HTML Telegram alert.
-        """
         base_token = pair.get("baseToken", {})
         token_name = base_token.get("name", "Unknown Token")
         token_symbol = base_token.get("symbol", "TOKEN")
@@ -110,9 +106,6 @@ class BuyTrackerBot:
         return message
 
     async def send_telegram_alert(self, message: str):
-        """
-        Sends formatted alert with inline trade button to targeted Chat ID.
-        """
         reply_markup = InlineKeyboardMarkup([
             [InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]
         ])
@@ -130,9 +123,6 @@ class BuyTrackerBot:
             logger.error(f"Failed to send Telegram alert: {e}")
 
     async def process_pair_updates(self, pair: Dict[str, Any]):
-        """
-        Tracks short-term transaction and volume deltas to isolate individual buys.
-        """
         txns = pair.get("txns", {})
         m5_txns = txns.get("m5", {})
         current_buys = m5_txns.get("buys", 0)
@@ -140,20 +130,17 @@ class BuyTrackerBot:
         volume = pair.get("volume", {})
         current_vol_m5 = float(volume.get("m5", 0.0))
 
-        # First run: set baseline
         if self.last_buy_count is None or self.last_volume_m5 is None:
             self.last_buy_count = current_buys
             self.last_volume_m5 = current_vol_m5
             logger.info(f"Tracking initialized. 5m Buys: {current_buys}, 5m Vol: ${current_vol_m5:,.2f}")
             return
 
-        # Rollover check (when DexScreener rolling 5m window updates)
         if current_buys < self.last_buy_count or current_vol_m5 < self.last_volume_m5:
             self.last_buy_count = current_buys
             self.last_volume_m5 = current_vol_m5
             return
 
-        # Calculate transaction & volume deltas
         buy_delta = current_buys - self.last_buy_count
         vol_delta = current_vol_m5 - self.last_volume_m5
 
@@ -169,9 +156,6 @@ class BuyTrackerBot:
             self.last_volume_m5 = current_vol_m5
 
     async def run(self):
-        """
-        Main continuous polling loop.
-        """
         logger.info(f"Bot starting up for chain: '{CHAIN_ID}' | Pair: '{PAIR_ADDRESS}'...")
         async with aiohttp.ClientSession() as session:
             while True:
@@ -185,9 +169,30 @@ class BuyTrackerBot:
                 await asyncio.sleep(POLL_INTERVAL)
 
 
-if __name__ == "__main__":
+# ==========================================
+# WEB SERVER FOR RENDER / UPTIMEROBOT
+# ==========================================
+async def handle_health_check(request):
+    return web.Response(text="Bot is running 24/7!")
+
+async def main():
+    # 1. Bind Web Server to Render Port
+    app = web.Application()
+    app.router.add_get("/", handle_handle_health_check if 'handle_handle_health_check' in locals() else handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Web server active on port {port}")
+
+    # 2. Start Bot
     tracker = BuyTrackerBot(token=BOT_TOKEN, chat_id=CHAT_ID)
+    await tracker.run()
+
+if __name__ == "__main__":
     try:
-        asyncio.run(tracker.run())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot manually terminated.")
