@@ -24,7 +24,7 @@ MIN_BUY_THRESHOLD_USD = 10.0
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
 
 # Polling Interval & API Config
-POLL_INTERVAL = 5  # seconds
+POLL_INTERVAL = 15  # seconds
 DEXSCREENER_API_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
 
 # Rate-limit Backoff Settings
