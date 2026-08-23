@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import aiohttp
 from aiohttp import web
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,103 +13,73 @@ from telegram.error import TelegramError
 BOT_TOKEN = "8803027756:AAHN1gHf2AmvjKgvJM71y1E-TtGHPO5fqcE"
 CHAT_ID = "-5328643185"
 
-# Target Token/Pair Settings
 CHAIN_ID = "solana"
 PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
-
-# Buy Alert Threshold (in USD)
 MIN_BUY_THRESHOLD_USD = 250.0
-
-# Trojan Affiliate Referral Link
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
+POLL_INTERVAL = 10 
 
-# Polling Interval & API Config
-POLL_INTERVAL = 15  # seconds
-DEXSCREENER_API_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
+# RPC/API Pool (Primary + Fallbacks)
+DEXSCREENER_ENDPOINTS = [
+    f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}",
+    f"https://api.dexscreener.io/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}" # Fallback
+]
 
-# Rate-limit Backoff Settings
-MAX_RETRIES = 3
-INITIAL_BACKOFF = 2.0  # seconds
-
-# ==========================================
-# LOGGING SETUP
-# ==========================================
-logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("AlphaBuyTrackerBot")
 
-
-class BuyTrackerBot:
+class ResilientBuyTrackerBot:
     def __init__(self, token: str, chat_id: str):
         self.bot = Bot(token=token)
         self.chat_id = chat_id
-        
-        # Internal state tracking
-        self.last_buy_count: Optional[int] = None
-        self.last_volume_m5: Optional[float] = None
+        self.endpoint_idx = 0
+        self.last_seen_volume: Optional[float] = None
+
+    def get_api_url(self) -> str:
+        return DEXSCREENER_ENDPOINTS[self.endpoint_idx]
+
+    def rotate_endpoint(self):
+        self.endpoint_idx = (self.endpoint_idx + 1) % len(DEXSCREENER_ENDPOINTS)
+        logger.warning(f"Switched endpoint to: {self.get_api_url()}")
 
     async def fetch_pair_data(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        backoff = INITIAL_BACKOFF
-        for attempt in range(1, MAX_RETRIES + 1):
+        for attempt in range(len(DEXSCREENER_ENDPOINTS)):
+            url = self.get_api_url()
             try:
-                async with session.get(DEXSCREENER_API_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        pairs = data.get("pairs")
-                        if pairs and len(pairs) > 0:
+                        pairs = data.get("pairs", [])
+                        if pairs:
                             return pairs[0]
-                        else:
-                            logger.warning(f"No pair found on chain '{CHAIN_ID}' for address '{PAIR_ADDRESS}'")
-                            return None
-                    elif resp.status == 429:
-                        logger.warning(f"Rate limited (429). Retrying in {backoff}s... (Attempt {attempt}/{MAX_RETRIES})")
-                        await asyncio.sleep(backoff)
-                        backoff *= 2
-                    else:
-                        logger.error(f"DexScreener API returned HTTP {resp.status}")
-                        return None
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.error(f"Network error on attempt {attempt}: {e}")
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                else:
-                    logger.error("Max retries reached while querying DexScreener.")
-                    return None
+                    elif resp.status in (429, 502, 503):
+                        logger.warning(f"HTTP {resp.status} on {url}. Rotating...")
+                        self.rotate_endpoint()
+            except Exception as e:
+                logger.error(f"Error connecting to {url}: {e}")
+                self.rotate_endpoint()
+            await asyncio.sleep(1)
         return None
 
     def format_alert_message(self, pair: Dict[str, Any], buy_amount_usd: float) -> str:
         base_token = pair.get("baseToken", {})
-        token_name = base_token.get("name", "Unknown Token")
+        token_name = base_token.get("name", "Unknown")
         token_symbol = base_token.get("symbol", "TOKEN")
-        
         price_usd_str = pair.get("priceUsd", "0.00")
-        try:
-            price_usd = float(price_usd_str)
-            formatted_price = f"${price_usd:,.6f}" if price_usd < 1 else f"${price_usd:,.2f}"
-        except ValueError:
-            formatted_price = f"${price_usd_str}"
-
         mcap = pair.get("marketCap") or pair.get("fdv") or 0.0
         chart_url = pair.get("url", f"https://dexscreener.com/{CHAIN_ID}/{PAIR_ADDRESS}")
 
-        message = (
+        return (
             f"🚨 <b>ALPHA BUY DETECTED!</b> 🚨\n\n"
             f"🪙 <b>Token:</b> {token_name} (${token_symbol})\n"
             f"💰 <b>Buy Amount:</b> <code>${buy_amount_usd:,.2f} USD</code>\n"
-            f"🏷 <b>Current Price:</b> {formatted_price}\n"
+            f"🏷 <b>Current Price:</b> ${float(price_usd_str):,.6f}\n"
             f"📊 <b>Market Cap:</b> ${mcap:,.0f}\n\n"
             f"📈 <a href='{chart_url}'>View Chart on DexScreener</a>"
         )
-        return message
 
     async def send_telegram_alert(self, message: str):
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]
-        ])
-
+        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id,
@@ -118,45 +88,32 @@ class BuyTrackerBot:
                 reply_markup=reply_markup,
                 disable_web_page_preview=False
             )
-            logger.info("Buy alert successfully dispatched to Telegram.")
+            logger.info("Buy alert dispatched.")
         except TelegramError as e:
-            logger.error(f"Failed to send Telegram alert: {e}")
+            logger.error(f"Telegram dispatch failed: {e}")
 
     async def process_pair_updates(self, pair: Dict[str, Any]):
-        txns = pair.get("txns", {})
-        m5_txns = txns.get("m5", {})
-        current_buys = m5_txns.get("buys", 0)
+        # Calculate overall volume delta rather than decaying rolling window
+        total_vol = float(pair.get("volume", {}).get("h24", 0.0))
 
-        volume = pair.get("volume", {})
-        current_vol_m5 = float(volume.get("m5", 0.0))
-
-        if self.last_buy_count is None or self.last_volume_m5 is None:
-            self.last_buy_count = current_buys
-            self.last_volume_m5 = current_vol_m5
-            logger.info(f"Tracking initialized. 5m Buys: {current_buys}, 5m Vol: ${current_vol_m5:,.2f}")
+        if self.last_seen_volume is None:
+            self.last_seen_volume = total_vol
+            logger.info(f"Initialized tracking. 24h Vol: ${total_vol:,.2f}")
             return
 
-        if current_buys < self.last_buy_count or current_vol_m5 < self.last_volume_m5:
-            self.last_buy_count = current_buys
-            self.last_volume_m5 = current_vol_m5
-            return
+        vol_delta = total_vol - self.last_seen_volume
 
-        buy_delta = current_buys - self.last_buy_count
-        vol_delta = current_vol_m5 - self.last_volume_m5
-
-        if buy_delta > 0 and vol_delta > 0:
-            estimated_buy_usd = vol_delta / buy_delta
-            logger.info(f"New Buy Delta: {buy_delta} | Est. Vol: ${vol_delta:,.2f} | Avg Buy: ${estimated_buy_usd:,.2f}")
-
-            if estimated_buy_usd >= MIN_BUY_THRESHOLD_USD:
-                alert_text = self.format_alert_message(pair, estimated_buy_usd)
-                await self.send_telegram_alert(alert_text)
-
-            self.last_buy_count = current_buys
-            self.last_volume_m5 = current_vol_m5
+        # If 24h volume increased, evaluate volume movement
+        if vol_delta >= MIN_BUY_THRESHOLD_USD:
+            logger.info(f"Volume surge detected: +${vol_delta:,.2f}")
+            alert_text = self.format_alert_message(pair, vol_delta)
+            await self.send_telegram_alert(alert_text)
+            self.last_seen_volume = total_vol
+        elif total_vol > self.last_seen_volume:
+            self.last_seen_volume = total_vol
 
     async def run(self):
-        logger.info(f"Bot starting up for chain: '{CHAIN_ID}' | Pair: '{PAIR_ADDRESS}'...")
+        logger.info("Bot execution started...")
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
@@ -164,35 +121,27 @@ class BuyTrackerBot:
                     if pair_data:
                         await self.process_pair_updates(pair_data)
                 except Exception as e:
-                    logger.exception(f"Unexpected error in polling cycle: {e}")
-                
+                    logger.exception(f"Loop exception: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
-
-# ==========================================
-# WEB SERVER FOR RENDER / UPTIMEROBOT
-# ==========================================
 async def handle_health_check(request):
-    return web.Response(text="Bot is running 24/7!")
+    return web.Response(text="Bot Active")
 
 async def main():
-    # 1. Bind Web Server to Render Port
     app = web.Application()
-    app.router.add_get("/", handle_handle_health_check if 'handle_handle_health_check' in locals() else handle_health_check)
+    app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Web server active on port {port}")
 
-    # 2. Start Bot
-    tracker = BuyTrackerBot(token=BOT_TOKEN, chat_id=CHAT_ID)
+    tracker = ResilientBuyTrackerBot(token=BOT_TOKEN, chat_id=CHAT_ID)
     await tracker.run()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot manually terminated.")
+        logger.info("Terminated.")
