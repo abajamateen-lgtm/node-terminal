@@ -18,7 +18,7 @@ PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
 
 # Minimum number of NEW buy transactions (since last poll) to trigger an alert.
 # This is the real fix: we now count actual buy txns, not 24h volume drift.
-MIN_NEW_BUYS_TO_ALERT = 1
+MIN_NEW_BUYS_TO_ALERT = 3
 
 # Optional: also require a minimum estimated USD size per alert batch.
 # Set to 0 to disable this filter entirely (recommended while testing).
