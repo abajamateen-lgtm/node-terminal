@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import aiohttp
 from aiohttp import web
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
@@ -13,73 +13,117 @@ from telegram.error import TelegramError
 BOT_TOKEN = "8803027756:AAHN1gHf2AmvjKgvJM71y1E-TtGHPO5fqcE"
 CHAT_ID = "-5328643185"
 
+# Target Token & Network Settings
 CHAIN_ID = "solana"
 PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
-MIN_BUY_THRESHOLD_USD = 1.0
+
+# Set LOW for testing! (Change back to 100.0 or 250.0 after confirming alerts work)
+MIN_BUY_THRESHOLD_USD = 1.0 
+
+# Referral Link
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
+
+# Polling Interval (in seconds)
 POLL_INTERVAL = 10 
 
-# RPC/API Pool (Primary + Fallbacks)
-DEXSCREENER_ENDPOINTS = [
-    f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}",
-    f"https://api.dexscreener.io/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}" # Fallback
-]
+# Free Endpoints (No API Keys Required)
+DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
+GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/pools/{PAIR_ADDRESS}"
 
-logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger("AlphaBuyTrackerBot")
+# ==========================================
+# LOGGING SETUP
+# ==========================================
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger("FreeSolanaBuyTracker")
 
-class ResilientBuyTrackerBot:
+class SolanaBuyTracker:
     def __init__(self, token: str, chat_id: str):
         self.bot = Bot(token=token)
         self.chat_id = chat_id
-        self.endpoint_idx = 0
-        self.last_seen_volume: Optional[float] = None
+        
+        # State Tracking
+        self.last_volume_h24: Optional[float] = None
+        self.using_fallback = False
 
-    def get_api_url(self) -> str:
-        return DEXSCREENER_ENDPOINTS[self.endpoint_idx]
-
-    def rotate_endpoint(self):
-        self.endpoint_idx = (self.endpoint_idx + 1) % len(DEXSCREENER_ENDPOINTS)
-        logger.warning(f"Switched endpoint to: {self.get_api_url()}")
-
-    async def fetch_pair_data(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        for attempt in range(len(DEXSCREENER_ENDPOINTS)):
-            url = self.get_api_url()
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        pairs = data.get("pairs", [])
-                        if pairs:
-                            return pairs[0]
-                    elif resp.status in (429, 502, 503):
-                        logger.warning(f"HTTP {resp.status} on {url}. Rotating...")
-                        self.rotate_endpoint()
-            except Exception as e:
-                logger.error(f"Error connecting to {url}: {e}")
-                self.rotate_endpoint()
-            await asyncio.sleep(1)
+    async def fetch_dexscreener(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+        """Primary free provider: DexScreener"""
+        try:
+            async with session.get(DEXSCREENER_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    pairs = data.get("pairs")
+                    if pairs and len(pairs) > 0:
+                        p = pairs[0]
+                        return {
+                            "name": p.get("baseToken", {}).get("name", "Unknown"),
+                            "symbol": p.get("baseToken", {}).get("symbol", "TOKEN"),
+                            "price": float(p.get("priceUsd", 0.0)),
+                            "mcap": p.get("marketCap") or p.get("fdv") or 0.0,
+                            "volume_24h": float(p.get("volume", {}).get("h24", 0.0)),
+                            "url": p.get("url", f"https://dexscreener.com/{CHAIN_ID}/{PAIR_ADDRESS}")
+                        }
+                elif resp.status == 429:
+                    logger.warning("DexScreener Rate Limited (429). Switching to fallback...")
+        except Exception as e:
+            logger.error(f"DexScreener Error: {e}")
         return None
 
-    def format_alert_message(self, pair: Dict[str, Any], buy_amount_usd: float) -> str:
-        base_token = pair.get("baseToken", {})
-        token_name = base_token.get("name", "Unknown")
-        token_symbol = base_token.get("symbol", "TOKEN")
-        price_usd_str = pair.get("priceUsd", "0.00")
-        mcap = pair.get("marketCap") or pair.get("fdv") or 0.0
-        chart_url = pair.get("url", f"https://dexscreener.com/{CHAIN_ID}/{PAIR_ADDRESS}")
+    async def fetch_geckoterminal(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+        """Fallback free provider: GeckoTerminal"""
+        try:
+            async with session.get(GECKOTERMINAL_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                if resp.status == 200:
+                    res = await resp.json()
+                    attr = res.get("data", {}).get("attributes", {})
+                    if attr:
+                        return {
+                            "name": attr.get("name", "Unknown Token"),
+                            "symbol": attr.get("name", "TOKEN").split(" / ")[0],
+                            "price": float(attr.get("base_token_price_usd", 0.0)),
+                            "mcap": float(attr.get("fdv_usd", 0.0)),
+                            "volume_24h": float(attr.get("volume_usd", {}).get("h24", 0.0)),
+                            "url": f"https://www.geckoterminal.com/{CHAIN_ID}/pools/{PAIR_ADDRESS}"
+                        }
+        except Exception as e:
+            logger.error(f"GeckoTerminal Error: {e}")
+        return None
+
+    async def fetch_pair_data(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
+        # Attempt primary first
+        data = await self.fetch_dexscreener(session)
+        if data:
+            self.using_fallback = False
+            return data
+            
+        # Fallback if DexScreener fails
+        logger.info("Retrying with GeckoTerminal fallback...")
+        data = await self.fetch_geckoterminal(session)
+        if data:
+            self.using_fallback = True
+            return data
+            
+        return None
+
+    def format_alert_message(self, data: Dict[str, Any], buy_amount_usd: float) -> str:
+        price_usd = data["price"]
+        formatted_price = f"${price_usd:,.6f}" if price_usd < 1 else f"${price_usd:,.2f}"
 
         return (
             f"🚨 <b>ALPHA BUY DETECTED!</b> 🚨\n\n"
-            f"🪙 <b>Token:</b> {token_name} (${token_symbol})\n"
-            f"💰 <b>Buy Amount:</b> <code>${buy_amount_usd:,.2f} USD</code>\n"
-            f"🏷 <b>Current Price:</b> ${float(price_usd_str):,.6f}\n"
-            f"📊 <b>Market Cap:</b> ${mcap:,.0f}\n\n"
-            f"📈 <a href='{chart_url}'>View Chart on DexScreener</a>"
+            f"🪙 <b>Token:</b> {data['name']} (${data['symbol']})\n"
+            f"💰 <b>Estimated Buy:</b> <code>${buy_amount_usd:,.2f} USD</code>\n"
+            f"🏷 <b>Price:</b> {formatted_price}\n"
+            f"📊 <b>Market Cap:</b> ${data['mcap']:,.0f}\n\n"
+            f"📈 <a href='{data['url']}'>View Chart</a>"
         )
 
     async def send_telegram_alert(self, message: str):
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]
+        ])
         try:
             await self.bot.send_message(
                 chat_id=self.chat_id,
@@ -88,46 +132,52 @@ class ResilientBuyTrackerBot:
                 reply_markup=reply_markup,
                 disable_web_page_preview=False
             )
-            logger.info("Buy alert dispatched.")
+            logger.info("Telegram notification sent successfully!")
         except TelegramError as e:
-            logger.error(f"Telegram dispatch failed: {e}")
+            logger.error(f"Telegram Dispatch Error: {e}")
 
-    async def process_pair_updates(self, pair: Dict[str, Any]):
-        # Calculate overall volume delta rather than decaying rolling window
-        total_vol = float(pair.get("volume", {}).get("h24", 0.0))
+    async def process_data(self, data: Dict[str, Any]):
+        current_vol = data["volume_24h"]
 
-        if self.last_seen_volume is None:
-            self.last_seen_volume = total_vol
-            logger.info(f"Initialized tracking. 24h Vol: ${total_vol:,.2f}")
+        # Baseline Initialization
+        if self.last_volume_h24 is None:
+            self.last_volume_h24 = current_vol
+            logger.info(f"Initialized tracking for {data['symbol']}. Initial 24h Vol: ${current_vol:,.2f}")
             return
 
-        vol_delta = total_vol - self.last_seen_volume
+        # Volume Increase Calculation
+        vol_delta = current_vol - self.last_volume_h24
 
-        # If 24h volume increased, evaluate volume movement
         if vol_delta >= MIN_BUY_THRESHOLD_USD:
-            logger.info(f"Volume surge detected: +${vol_delta:,.2f}")
-            alert_text = self.format_alert_message(pair, vol_delta)
+            logger.info(f"Volume Increase Detected: +${vol_delta:,.2f}")
+            alert_text = self.format_alert_message(data, vol_delta)
             await self.send_telegram_alert(alert_text)
-            self.last_seen_volume = total_vol
-        elif total_vol > self.last_seen_volume:
-            self.last_seen_volume = total_vol
+            self.last_volume_h24 = current_vol
+        elif current_vol > self.last_volume_h24:
+            # Sync volume up quietly if under threshold
+            self.last_volume_h24 = current_vol
 
     async def run(self):
-        logger.info("Bot execution started...")
+        logger.info(f"Starting free tracking bot for pair: {PAIR_ADDRESS}")
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    pair_data = await self.fetch_pair_data(session)
-                    if pair_data:
-                        await self.process_pair_updates(pair_data)
+                    data = await self.fetch_pair_data(session)
+                    if data:
+                        await self.process_data(data)
                 except Exception as e:
-                    logger.exception(f"Loop exception: {e}")
+                    logger.exception(f"Error in execution loop: {e}")
+                
                 await asyncio.sleep(POLL_INTERVAL)
 
+# ==========================================
+# WEB SERVER FOR RENDER / UPTIMEROBOT
+# ==========================================
 async def handle_health_check(request):
-    return web.Response(text="Bot Active")
+    return web.Response(text="Bot is running 24/7!")
 
 async def main():
+    # Bind Web Server to Render Port
     app = web.Application()
     app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(app)
@@ -136,12 +186,14 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logger.info(f"Health check web server running on port {port}")
 
-    tracker = ResilientBuyTrackerBot(token=BOT_TOKEN, chat_id=CHAT_ID)
+    # Start Bot
+    tracker = SolanaBuyTracker(token=BOT_TOKEN, chat_id=CHAT_ID)
     await tracker.run()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Terminated.")
+        logger.info("Bot manually stopped.")
