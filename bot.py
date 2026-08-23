@@ -11,7 +11,7 @@ from telegram.error import TelegramError
 # CONFIGURATION
 # ==========================================
 BOT_TOKEN = "8803027756:AAHN1gHf2AmvjKgvJM71y1E-TtGHPO5fqcE"
-CHAT_ID = "-5328643185"
+CHAT_ID = "-1004364300853"
 
 # Target Token & Network Settings
 CHAIN_ID = "solana"
