@@ -18,7 +18,7 @@ CHAIN_ID = "solana"
 PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
 
 # Buy Alert Threshold (in USD)
-MIN_BUY_THRESHOLD_USD = 1000.0
+MIN_BUY_THRESHOLD_USD = 250.0
 
 # Trojan Affiliate Referral Link
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
