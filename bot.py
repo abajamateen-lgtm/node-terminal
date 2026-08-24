@@ -27,8 +27,11 @@ POLL_INTERVAL = 10
 SEND_STARTUP_TEST_MESSAGE = True
 
 DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
-GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/{PAIR_ADDRESS}"
+GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/pools/{PAIR_ADDRESS}"
 DB_FILE = "bot_data.db"
+
+# Admin Telegram User ID Lock
+ADMIN_TELEGRAM_ID = "7983373518"
 
 # ==========================================
 # LOGGING SETUP
@@ -40,7 +43,7 @@ logger = logging.getLogger("SolanaBuyTracker")
 
 
 # ==========================================
-# DATABASE SETUP (NO CREDENTIALS NEEDED)
+# DATABASE SETUP
 # ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -75,7 +78,7 @@ def init_db():
         )
     """)
     
-    # Insert a default sample task if empty
+    # Seed default task if database is empty
     cursor.execute("SELECT COUNT(*) FROM tasks")
     if cursor.fetchone()[0] == 0:
         cursor.execute(
@@ -90,7 +93,7 @@ init_db()
 
 
 # ==========================================
-# COMMAND HANDLERS
+# USER COMMAND HANDLERS
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -279,6 +282,74 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
+# ADMIN COMMAND HANDLERS
+# ==========================================
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM user_tasks")
+    total_tasks_completed = cursor.fetchone()[0]
+    cursor.execute("SELECT SUM(balance_sol) FROM users")
+    total_user_balances = cursor.fetchone()[0] or 0.0
+    conn.close()
+
+    msg = (
+        "👑 <b>Admin System Dashboard</b>\n\n"
+        f"👥 <b>Total Registered Users:</b> <code>{total_users}</code>\n"
+        f"✅ <b>Total Tasks Completed:</b> <code>{total_tasks_completed}</code>\n"
+        f"💰 <b>Total User Liability (Owed):</b> <code>{total_user_balances:.4f} SOL</code>\n\n"
+        "<i>Use /addtask Title | @ChannelUsername | RewardSOL to add tasks.</i>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    raw_text = " ".join(context.args)
+    if not raw_text or "|" not in raw_text:
+        await update.message.reply_text(
+            "⚠️ <b>Format:</b>\n<code>/addtask Title | @ChannelUsername | RewardSOL</code>\n\n"
+            "<b>Example:</b>\n<code>/addtask Join Alpha Group | @alphachannel | 0.002</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        title, channel, reward = [item.strip() for item in raw_text.split("|")]
+        reward_sol = float(reward)
+
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO tasks (title, channel_username, reward_sol) VALUES (?, ?, ?)",
+            (title, channel, reward_sol)
+        )
+        conn.commit()
+        conn.close()
+
+        await update.message.reply_text(
+            f"✅ <b>Task Added Successfully!</b>\n\n"
+            f"📌 <b>Title:</b> {title}\n"
+            f"📢 <b>Channel:</b> {channel}\n"
+            f"💰 <b>Reward:</b> {reward_sol} SOL",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error adding task: {e}")
+
+
+# ==========================================
 # BUY TRACKER LOOP
 # ==========================================
 class SolanaBuyTracker:
@@ -364,7 +435,7 @@ async def handle_health_check(request):
 async def main():
     app_telegram = Application.builder().token(BOT_TOKEN).build()
 
-    # Register Bot Commands
+    # Register User Command Handlers
     app_telegram.add_handler(CommandHandler("start", start_command))
     app_telegram.add_handler(CommandHandler("tasks", tasks_command))
     app_telegram.add_handler(CommandHandler("balance", balance_command))
@@ -373,11 +444,15 @@ async def main():
     app_telegram.add_handler(CommandHandler("help", help_command))
     app_telegram.add_handler(CallbackQueryHandler(verify_task_callback, pattern="^verify_"))
 
+    # Register Admin Command Handlers
+    app_telegram.add_handler(CommandHandler("admin", admin_command))
+    app_telegram.add_handler(CommandHandler("addtask", addtask_command))
+
     await app_telegram.initialize()
     await app_telegram.start()
     await app_telegram.updater.start_polling()
 
-    # Web Server for Health Checks
+    # Web Server for Hosting Health Checks
     web_app = web.Application()
     web_app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(web_app)
@@ -386,7 +461,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # Run Tracker Background Task
+    # Run Background Tracker
     tracker = SolanaBuyTracker(app_telegram, CHAT_ID)
     await tracker.run()
 
