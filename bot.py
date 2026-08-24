@@ -1,11 +1,17 @@
 import asyncio
 import logging
 import os
-from typing import Optional, Dict, Any, List
+import sqlite3
+from typing import Optional, Dict, Any
 import aiohttp
 from aiohttp import web
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.error import TelegramError
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 # ==========================================
 # CONFIGURATION
@@ -15,50 +21,273 @@ CHAT_ID = os.environ.get("CHAT_ID", "-1004364300853")
 
 CHAIN_ID = "solana"
 PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
-
-# Minimum number of NEW buy transactions (since last poll) to trigger an alert.
-# This is the real fix: we now count actual buy txns, not 24h volume drift.
 MIN_NEW_BUYS_TO_ALERT = 3
-
-# Optional: also require a minimum estimated USD size per alert batch.
-# Set to 0 to disable this filter entirely (recommended while testing).
-MIN_BUY_THRESHOLD_USD = 0.0
-
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
-
 POLL_INTERVAL = 10
-
-# Send one alert to confirm Telegram delivery works, at startup.
 SEND_STARTUP_TEST_MESSAGE = True
 
 DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
-GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/pools/{PAIR_ADDRESS}"
+GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/{PAIR_ADDRESS}"
+DB_FILE = "bot_data.db"
 
 # ==========================================
 # LOGGING SETUP
 # ==========================================
 logging.basicConfig(
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger("SolanaBuyTracker")
 
 
-class SolanaBuyTracker:
-    def __init__(self, token: str, chat_id: str):
-        self.bot = Bot(token=token)
-        self.chat_id = chat_id
+# ==========================================
+# DATABASE SETUP (NO CREDENTIALS NEEDED)
+# ==========================================
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Users Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id TEXT PRIMARY KEY,
+            solana_wallet TEXT,
+            balance_sol REAL DEFAULT 0.0,
+            referrer_id TEXT
+        )
+    """)
+    
+    # Tasks Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            channel_username TEXT,
+            reward_sol REAL
+        )
+    """)
+    
+    # Completed Tasks Log
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_tasks (
+            user_id TEXT,
+            task_id INTEGER,
+            PRIMARY KEY (user_id, task_id)
+        )
+    """)
+    
+    # Insert a default sample task if empty
+    cursor.execute("SELECT COUNT(*) FROM tasks")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute(
+            "INSERT INTO tasks (title, channel_username, reward_sol) VALUES (?, ?, ?)",
+            ("Join Official Updates Channel", "@Telegram", 0.001)
+        )
+        
+    conn.commit()
+    conn.close()
 
-        # State tracking — now based on transaction COUNTS, not volume dollars.
-        # txns.h1.buys is a live rolling counter DexScreener updates frequently,
-        # unlike volume.h24 which can sit flat for long stretches.
+init_db()
+
+
+# ==========================================
+# COMMAND HANDLERS
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    user_id = str(user.id)
+    args = context.args
+    referrer_id = args[0] if args else None
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (user_id,))
+    existing_user = cursor.fetchone()
+
+    if not existing_user:
+        valid_referrer = referrer_id if referrer_id and referrer_id != user_id else None
+        cursor.execute(
+            "INSERT INTO users (telegram_id, referrer_id) VALUES (?, ?)",
+            (user_id, valid_referrer)
+        )
+        conn.commit()
+
+    conn.close()
+
+    bot_info = await context.bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+
+    msg = (
+        f"👋 <b>Welcome {user.first_name}!</b>\n\n"
+        "💰 Complete quick Web3 tasks to earn $SOL rewards.\n"
+        "📊 Track live buy alerts directly in your groups.\n\n"
+        f"🔗 <b>Your Invite Link:</b>\n<code>{ref_link}</code>\n\n"
+        "Earn a bonus every time a friend you refer completes a task!"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, channel_username, reward_sol FROM tasks")
+    tasks = cursor.fetchall()
+
+    if not tasks:
+        await update.message.reply_text("📋 No tasks available right now. Check back later!")
+        conn.close()
+        return
+
+    for task_id, title, channel, reward in tasks:
+        cursor.execute(
+            "SELECT 1 FROM user_tasks WHERE user_id = ? AND task_id = ?",
+            (user_id, task_id)
+        )
+        completed = cursor.fetchone() is not None
+
+        status_text = "✅ Completed" if completed else f"💰 Reward: {reward} SOL"
+        text = f"📌 <b>{title}</b>\nChannel: {channel}\nStatus: {status_text}"
+
+        buttons = []
+        if not completed:
+            buttons.append([
+                InlineKeyboardButton("🔗 Open Channel", url=f"https://t.me/{channel.replace('@', '')}"),
+                InlineKeyboardButton("✅ Verify Join", callback_data=f"verify_{task_id}")
+            ])
+        
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
+    conn.close()
+
+
+async def verify_task_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    task_id = int(query.data.split("_")[1])
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT channel_username, reward_sol FROM tasks WHERE id = ?", (task_id,))
+    task = cursor.fetchone()
+
+    if not task:
+        await query.edit_message_text("Task not found.")
+        conn.close()
+        return
+
+    channel, reward = task
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=channel, user_id=int(user_id))
+        if member.status in ["member", "administrator", "creator"]:
+            cursor.execute(
+                "INSERT INTO user_tasks (user_id, task_id) VALUES (?, ?)",
+                (user_id, task_id)
+            )
+            cursor.execute(
+                "UPDATE users SET balance_sol = balance_sol + ? WHERE telegram_id = ?",
+                (reward, user_id)
+            )
+
+            # Referral Bonus (10%)
+            cursor.execute("SELECT referrer_id FROM users WHERE telegram_id = ?", (user_id,))
+            ref_row = cursor.fetchone()
+            if ref_row and ref_row[0]:
+                ref_bonus = reward * 0.10
+                cursor.execute(
+                    "UPDATE users SET balance_sol = balance_sol + ? WHERE telegram_id = ?",
+                    (ref_bonus, ref_row[0])
+                )
+
+            conn.commit()
+            await query.edit_message_text(f"🎉 <b>Task Verified!</b> Earned {reward} SOL.", parse_mode="HTML")
+        else:
+            await query.message.reply_text("❌ You have not joined the channel yet!")
+    except Exception as e:
+        logger.error(f"Verification error: {e}")
+        await query.message.reply_text("⚠️ Verification failed. Make sure the bot is an admin in the target channel.")
+
+    conn.close()
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
+    row = cursor.fetchone()
+
+    cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
+    ref_count = cursor.fetchone()[0]
+    conn.close()
+
+    balance = row[0] if row else 0.0
+    wallet = row[1] if row and row[1] else "Not set"
+
+    msg = (
+        "💼 <b>Your Account Summary</b>\n\n"
+        f"💰 <b>Balance:</b> <code>{balance:.4f} SOL</code>\n"
+        f"👥 <b>Total Referrals:</b> <code>{ref_count}</code>\n"
+        f"💳 <b>Payout Wallet:</b> <code>{wallet}</code>\n\n"
+        "Use /withdraw to cash out or update your wallet address."
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "💸 <b>Withdraw Earnings</b>\n\n"
+        "To register or update your Solana payout address, reply with your wallet key like this:\n"
+        "<code>/wallet YOUR_SOLANA_WALLET_ADDRESS</code>\n\n"
+        "<i>Minimum payout threshold: 0.01 SOL (3% platform fee applies).</i>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def set_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text("⚠️ Please provide a wallet address. Example: `/wallet YourAddress`", parse_mode="Markdown")
+        return
+
+    wallet = context.args[0]
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET solana_wallet = ? WHERE telegram_id = ?", (wallet, user_id))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(f"✅ Solana payout wallet saved:\n<code>{wallet}</code>", parse_mode="HTML")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "❓ <b>Bot Help & Instructions</b>\n\n"
+        "• /tasks - Complete Web3 tasks for rewards\n"
+        "• /balance - View $SOL balance and referrals\n"
+        "• /withdraw - Request cashout or set wallet\n"
+        "• /start - Launch bot and view invite link"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ==========================================
+# BUY TRACKER LOOP
+# ==========================================
+class SolanaBuyTracker:
+    def __init__(self, application: Application, chat_id: str):
+        self.app = application
+        self.chat_id = chat_id
         self.last_buy_count: Optional[int] = None
         self.last_price: Optional[float] = None
-        self.consecutive_fetch_failures: int = 0
 
-    # ------------------------------------------------------------
-    # DATA FETCHING
-    # ------------------------------------------------------------
     async def fetch_dexscreener(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
         try:
             async with session.get(DEXSCREENER_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
@@ -66,7 +295,6 @@ class SolanaBuyTracker:
                     data = await resp.json()
                     pairs = data.get("pairs")
                     if not pairs:
-                        logger.warning("DexScreener returned 200 but no 'pairs' data. Check PAIR_ADDRESS.")
                         return None
                     p = pairs[0]
                     txns_h1 = p.get("txns", {}).get("h1", {}) or {}
@@ -75,232 +303,92 @@ class SolanaBuyTracker:
                         "symbol": p.get("baseToken", {}).get("symbol", "TOKEN"),
                         "price": float(p.get("priceUsd") or 0.0),
                         "mcap": p.get("marketCap") or p.get("fdv") or 0.0,
-                        "volume_24h": float(p.get("volume", {}).get("h24") or 0.0),
                         "buys_h1": int(txns_h1.get("buys") or 0),
-                        "sells_h1": int(txns_h1.get("sells") or 0),
                         "url": p.get("url", f"https://dexscreener.com/{CHAIN_ID}/{PAIR_ADDRESS}"),
-                        "source": "DexScreener",
                     }
-                elif resp.status == 429:
-                    logger.warning("DexScreener rate limited (429). Falling back to GeckoTerminal.")
-                else:
-                    logger.warning(f"DexScreener returned unexpected status {resp.status}.")
-        except asyncio.TimeoutError:
-            logger.error("DexScreener request timed out.")
         except Exception as e:
             logger.error(f"DexScreener fetch error: {e}")
         return None
 
-    async def fetch_geckoterminal(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        """
-        Fallback provider. Note: GeckoTerminal's pool endpoint does not expose
-        a per-transaction buy count the same way DexScreener does, so when we're
-        on this fallback we detect buys via price upticks instead (see process_data).
-        """
-        try:
-            async with session.get(GECKOTERMINAL_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    res = await resp.json()
-                    attr = res.get("data", {}).get("attributes", {})
-                    if not attr:
-                        logger.warning("GeckoTerminal returned 200 but no attributes. Check PAIR_ADDRESS.")
-                        return None
-                    return {
-                        "name": attr.get("name", "Unknown Token"),
-                        "symbol": (attr.get("name", "TOKEN").split(" / ") or ["TOKEN"])[0],
-                        "price": float(attr.get("base_token_price_usd") or 0.0),
-                        "mcap": float(attr.get("fdv_usd") or 0.0),
-                        "volume_24h": float((attr.get("volume_usd") or {}).get("h24") or 0.0),
-                        "buys_h1": None,  # not available from this endpoint
-                        "sells_h1": None,
-                        "url": f"https://www.geckoterminal.com/{CHAIN_ID}/pools/{PAIR_ADDRESS}",
-                        "source": "GeckoTerminal",
-                    }
-                else:
-                    logger.warning(f"GeckoTerminal returned unexpected status {resp.status}.")
-        except asyncio.TimeoutError:
-            logger.error("GeckoTerminal request timed out.")
-        except Exception as e:
-            logger.error(f"GeckoTerminal fetch error: {e}")
-        return None
-
-    async def fetch_pair_data(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        data = await self.fetch_dexscreener(session)
-        if data:
-            self.consecutive_fetch_failures = 0
-            return data
-
-        logger.info("Retrying with GeckoTerminal fallback...")
-        data = await self.fetch_geckoterminal(session)
-        if data:
-            self.consecutive_fetch_failures = 0
-            return data
-
-        self.consecutive_fetch_failures += 1
-        logger.error(
-            f"Both providers failed. Consecutive failures: {self.consecutive_fetch_failures}"
-        )
-        return None
-
-    # ------------------------------------------------------------
-    # MESSAGE FORMATTING
-    # ------------------------------------------------------------
-    def format_alert_message(self, data: Dict[str, Any], new_buys: int) -> str:
-        price_usd = data["price"]
-        formatted_price = f"${price_usd:,.8f}" if price_usd < 1 else f"${price_usd:,.2f}"
-
-        return (
-            f"🚨 <b>NEW BUY ACTIVITY DETECTED!</b> 🚨\n\n"
-            f"🪙 <b>Token:</b> {data['name']} (${data['symbol']})\n"
-            f"🛒 <b>New Buys:</b> <code>{new_buys}</code>\n"
-            f"🏷 <b>Price:</b> {formatted_price}\n"
-            f"📊 <b>Market Cap:</b> ${data['mcap']:,.0f}\n"
-            f"📡 <b>Source:</b> {data['source']}\n\n"
-            f"📈 <a href='{data['url']}'>View Chart</a>"
-        )
-
-    # ------------------------------------------------------------
-    # TELEGRAM DELIVERY
-    # ------------------------------------------------------------
-    async def send_telegram_alert(self, message: str) -> bool:
-        """Returns True if the message was sent successfully, False otherwise."""
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]
-        ])
-        try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=message,
-                parse_mode="HTML",
-                reply_markup=reply_markup,
-                disable_web_page_preview=False
-            )
-            logger.info("Telegram message sent successfully.")
-            return True
-        except TelegramError as e:
-            # This is the exact failure point that was silent before —
-            # now it's impossible to miss in the logs.
-            logger.error(f"TELEGRAM SEND FAILED: {e}")
-            logger.error(
-                "Common causes: bot not added to the chat/channel, bot lacks "
-                "post permission (needs admin in channels), wrong CHAT_ID, "
-                "or bot was blocked/removed."
-            )
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {e}")
-            return False
-
-    # ------------------------------------------------------------
-    # DETECTION LOGIC (the core fix)
-    # ------------------------------------------------------------
-    async def process_data(self, data: Dict[str, Any]):
-        current_price = data["price"]
-        buys_h1 = data["buys_h1"]
-
-        logger.info(
-            f"Poll check — source={data['source']} price=${current_price:,.8f} "
-            f"buys_h1={buys_h1} last_buy_count={self.last_buy_count}"
-        )
-
-        # First poll ever: just set the baseline, nothing to compare against yet.
-        if self.last_buy_count is None and buys_h1 is not None:
-            self.last_buy_count = buys_h1
-            self.last_price = current_price
-            logger.info(f"Baseline set. Starting buys_h1 count: {buys_h1}")
-            return
-
-        # PRIMARY PATH: DexScreener gives us a real rolling buy-transaction count.
-        if buys_h1 is not None and self.last_buy_count is not None:
-            new_buys = buys_h1 - self.last_buy_count
-
-            # h1 window can roll over and reset lower — treat a decrease as a
-            # fresh baseline rather than a negative "new buys" count.
-            if new_buys < 0:
-                logger.info("Buy counter rolled over (new h1 window). Resetting baseline.")
-                self.last_buy_count = buys_h1
-                return
-
-            if new_buys >= MIN_NEW_BUYS_TO_ALERT:
-                message = self.format_alert_message(data, new_buys)
-                sent = await self.send_telegram_alert(message)
-                if sent:
-                    self.last_buy_count = buys_h1
-                # If send failed, we deliberately do NOT update last_buy_count,
-                # so the same buys get retried on next poll instead of being lost.
-            else:
-                self.last_buy_count = buys_h1
-            return
-
-        # FALLBACK PATH: GeckoTerminal has no buy count, so detect via price uptick.
-        if self.last_price is not None and current_price > self.last_price:
-            pct_change = ((current_price - self.last_price) / self.last_price) * 100
-            message = self.format_alert_message(data, new_buys=1)
-            message += f"\n\n(⚠️ Fallback mode — detected via +{pct_change:.2f}% price uptick, not exact buy count)"
-            sent = await self.send_telegram_alert(message)
-            if sent:
-                self.last_price = current_price
-        else:
-            self.last_price = current_price
-
-    # ------------------------------------------------------------
-    # MAIN LOOP
-    # ------------------------------------------------------------
     async def run(self):
-        logger.info(f"Starting buy tracker for pair: {PAIR_ADDRESS}")
-
         if SEND_STARTUP_TEST_MESSAGE:
-            logger.info("Sending startup test message to confirm Telegram delivery works...")
-            ok = await self.send_telegram_alert(
-                "🧪 <b>Bot connected.</b> If you see this, Telegram delivery works "
-                "and any future silence means no qualifying buys were detected yet."
-            )
-            if not ok:
-                logger.error(
-                    "STARTUP TEST FAILED TO SEND. Fix Telegram delivery (bot membership/"
-                    "permissions/CHAT_ID) before expecting any real alerts to arrive."
+            try:
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
+                await self.app.bot.send_message(
+                    chat_id=self.chat_id,
+                    text="🧪 <b>Bot connected with Task & Referral System!</b>",
+                    parse_mode="HTML",
+                    reply_markup=reply_markup
                 )
+            except Exception as e:
+                logger.error(f"Startup test failed: {e}")
 
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    data = await self.fetch_pair_data(session)
+                    data = await self.fetch_dexscreener(session)
                     if data:
-                        await self.process_data(data)
-                    else:
-                        if self.consecutive_fetch_failures and self.consecutive_fetch_failures % 6 == 0:
-                            # Every ~minute of continuous failure at default POLL_INTERVAL, warn loudly.
-                            logger.error(
-                                f"No data for {self.consecutive_fetch_failures} consecutive polls. "
-                                "Check PAIR_ADDRESS, network access, or provider rate limits."
-                            )
+                        buys_h1 = data["buys_h1"]
+                        if self.last_buy_count is None:
+                            self.last_buy_count = buys_h1
+                        else:
+                            new_buys = buys_h1 - self.last_buy_count
+                            if new_buys >= MIN_NEW_BUYS_TO_ALERT:
+                                formatted_price = f"${data['price']:,.8f}" if data['price'] < 1 else f"${data['price']:,.2f}"
+                                msg = (
+                                    f"🚨 <b>NEW BUY ACTIVITY DETECTED!</b> 🚨\n\n"
+                                    f"🪙 <b>Token:</b> {data['name']} (${data['symbol']})\n"
+                                    f"🛒 <b>New Buys:</b> <code>{new_buys}</code>\n"
+                                    f"🏷 <b>Price:</b> {formatted_price}\n"
+                                    f"📊 <b>Market Cap:</b> ${data['mcap']:,.0f}\n\n"
+                                    f"📈 <a href='{data['url']}'>View Chart</a>"
+                                )
+                                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
+                                await self.app.bot.send_message(
+                                    chat_id=self.chat_id, text=msg, parse_mode="HTML", reply_markup=reply_markup
+                                )
+                                self.last_buy_count = buys_h1
+                            elif new_buys < 0:
+                                self.last_buy_count = buys_h1
                 except Exception as e:
-                    logger.exception(f"Unhandled error in polling loop: {e}")
-
+                    logger.error(f"Tracker loop error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
 
 # ==========================================
-# WEB SERVER FOR HOSTING PLATFORM HEALTH CHECKS
+# MAIN EXECUTION & HEALTH SERVER
 # ==========================================
 async def handle_health_check(request):
     return web.Response(text="Bot is running.")
 
-
 async def main():
-    app = web.Application()
-    app.router.add_get("/", handle_health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
+    app_telegram = Application.builder().token(BOT_TOKEN).build()
 
+    # Register Bot Commands
+    app_telegram.add_handler(CommandHandler("start", start_command))
+    app_telegram.add_handler(CommandHandler("tasks", tasks_command))
+    app_telegram.add_handler(CommandHandler("balance", balance_command))
+    app_telegram.add_handler(CommandHandler("withdraw", withdraw_command))
+    app_telegram.add_handler(CommandHandler("wallet", set_wallet_command))
+    app_telegram.add_handler(CommandHandler("help", help_command))
+    app_telegram.add_handler(CallbackQueryHandler(verify_task_callback, pattern="^verify_"))
+
+    await app_telegram.initialize()
+    await app_telegram.start()
+    await app_telegram.updater.start_polling()
+
+    # Web Server for Health Checks
+    web_app = web.Application()
+    web_app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Health check web server running on port {port}")
 
-    tracker = SolanaBuyTracker(token=BOT_TOKEN, chat_id=CHAT_ID)
+    # Run Tracker Background Task
+    tracker = SolanaBuyTracker(app_telegram, CHAT_ID)
     await tracker.run()
-
 
 if __name__ == "__main__":
     try:
