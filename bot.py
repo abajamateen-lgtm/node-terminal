@@ -151,7 +151,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         completed = cursor.fetchone() is not None
 
         status_text = "✅ Completed" if completed else f"💰 Reward: {reward} SOL"
-        text = f"📌 <b>{title}</b>\nChannel: {channel}\nStatus: {status_text}"
+        text = f"📌 <b>Task ID {task_id}: {title}</b>\nChannel: {channel}\nStatus: {status_text}"
 
         buttons = []
         if not completed:
@@ -305,7 +305,9 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 <b>Total Registered Users:</b> <code>{total_users}</code>\n"
         f"✅ <b>Total Tasks Completed:</b> <code>{total_tasks_completed}</code>\n"
         f"💰 <b>Total User Liability (Owed):</b> <code>{total_user_balances:.4f} SOL</code>\n\n"
-        "<i>Use /addtask Title | @ChannelUsername | RewardSOL to add tasks.</i>"
+        "<b>Commands:</b>\n"
+        "• <code>/addtask Title | @ChannelUsername | RewardSOL</code>\n"
+        "• <code>/deltask TASK_ID</code>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -347,6 +349,46 @@ async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         await update.message.reply_text(f"❌ Error adding task: {e}")
+
+
+async def deltask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id != ADMIN_TELEGRAM_ID:
+        await update.message.reply_text("⛔ Unauthorized access.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "⚠️ <b>Format:</b>\n<code>/deltask TASK_ID</code>\n\n"
+            "<b>Example:</b>\n<code>/deltask 1</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    task_id = int(context.args[0])
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT title FROM tasks WHERE id = ?", (task_id,))
+    task = cursor.fetchone()
+
+    if not task:
+        await update.message.reply_text(f"❌ Task ID <code>{task_id}</code> not found.", parse_mode="HTML")
+        conn.close()
+        return
+
+    cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+    cursor.execute("DELETE FROM user_tasks WHERE task_id = ?", (task_id,))
+    conn.commit()
+    conn.close()
+
+    await update.message.reply_text(
+        f"🗑️ <b>Task Removed Successfully!</b>\n\n"
+        f"📌 <b>Task ID:</b> <code>{task_id}</code>\n"
+        f"📝 <b>Title:</b> {task[0]}",
+        parse_mode="HTML"
+    )
 
 
 # ==========================================
@@ -447,6 +489,7 @@ async def main():
     # Register Admin Command Handlers
     app_telegram.add_handler(CommandHandler("admin", admin_command))
     app_telegram.add_handler(CommandHandler("addtask", addtask_command))
+    app_telegram.add_handler(CommandHandler("deltask", deltask_command))
 
     await app_telegram.initialize()
     await app_telegram.start()
