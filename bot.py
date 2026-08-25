@@ -12,9 +12,11 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+from solana.rpc.async_api import AsyncClient
+from solders.signature import Signature
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & FINANCIAL RULES
 # ==========================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8803027756:AAHN1gHf2AmvjKgvJM71y1E-TtGHPO5fqcE")
 CHAT_ID = os.environ.get("CHAT_ID", "-1004364300853")
@@ -27,11 +29,18 @@ POLL_INTERVAL = 10
 SEND_STARTUP_TEST_MESSAGE = True
 
 DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
-GECKOTERMINAL_URL = f"https://api.geckoterminal.com/api/v2/networks/{CHAIN_ID}/pools/{PAIR_ADDRESS}"
 DB_FILE = "bot_data.db"
 
 # Admin Telegram User ID Lock
 ADMIN_TELEGRAM_ID = "7983373518"
+
+# Financial Safety Limits
+MIN_TRADE_SOL = 0.1             # Trades below 0.1 SOL earn 0 cashback
+USER_CASHBACK_PERCENT = 0.00125 # 0.125% of trade volume (half of your 0.25% cut)
+MIN_WITHDRAW_SOL = 0.05         # Minimum cashout balance
+NETWORK_FEE_SOL = 0.005         # Gas offset deducted on withdrawal
+
+RPC_URL = "https://api.mainnet-beta.solana.com"
 
 # ==========================================
 # LOGGING SETUP
@@ -75,6 +84,13 @@ def init_db():
             user_id TEXT,
             task_id INTEGER,
             PRIMARY KEY (user_id, task_id)
+        )
+    """)
+
+    # Processed Transactions Log (Anti-Double Spend)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS processed_txs (
+            tx_hash TEXT PRIMARY KEY
         )
     """)
     
@@ -122,10 +138,162 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = (
         f"👋 <b>Welcome {user.first_name}!</b>\n\n"
-        "💰 Complete quick Web3 tasks to earn $SOL rewards.\n"
-        "📊 Track live buy alerts directly in your groups.\n\n"
+        "💰 <b>Earn $SOL Cashback:</b> Trade Solana tokens via Trojan & claim cashback rewards!\n"
+        "📋 <b>Web3 Tasks:</b> Complete quick channel tasks for extra earnings.\n"
+        "📊 <b>Buy Alerts:</b> Real-time whale and momentum signals delivered straight to chat.\n\n"
         f"🔗 <b>Your Invite Link:</b>\n<code>{ref_link}</code>\n\n"
-        "Earn a bonus every time a friend you refer completes a task!"
+        "<i>Earn a 10% bonus whenever your referrals complete tasks!</i>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def beginner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👋 <b>New to Solana Trading?</b>\n\n"
+        "1️⃣ <b>Get Your Trojan Wallet:</b>\n"
+        f"   • Tap <a href='{REFERRAL_URL}'>Launch Trojan Bot</a> to open your automated wallet.\n\n"
+        "2️⃣ <b>Deposit Solana:</b>\n"
+        "   • Copy your Trojan wallet address and send a small amount of SOL (e.g., 0.2 SOL).\n\n"
+        "3️⃣ <b>Trade & Earn Cashback:</b>\n"
+        "   • Whenever our bot posts a signal, hit <b>⚡ Buy on Trojan</b> to execute your trade.\n"
+        "   • Copy your Trojan Transaction Hash and send <code>/verify YOUR_TX_HASH</code> here to claim your cashback!"
+    )
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Open Trojan Wallet", url=REFERRAL_URL)]])
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
+
+
+async def verify_tx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ <b>Format:</b> <code>/verify YOUR_SOLANA_TX_HASH</code>\n\n"
+            "Paste the transaction hash from Trojan after completing a trade.",
+            parse_mode="HTML"
+        )
+        return
+
+    tx_hash = context.args[0].strip()
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+
+    # Double-spend check
+    cursor.execute("SELECT 1 FROM processed_txs WHERE tx_hash = ?", (tx_hash,))
+    if cursor.fetchone():
+        await update.message.reply_text("❌ This transaction hash has already been claimed!", parse_mode="HTML")
+        conn.close()
+        return
+
+    try:
+        async with AsyncClient(RPC_URL) as client:
+            sig = Signature.from_string(tx_hash)
+            response = await client.get_transaction(sig, encoding="jsonParsed", max_supported_transaction_version=0)
+
+            if not response.value:
+                await update.message.reply_text("❌ Transaction not found on Solana yet. Wait 5 seconds and retry.", parse_mode="HTML")
+                conn.close()
+                return
+
+            tx_data = response.value.transaction.meta
+            if tx_data.err is not None:
+                await update.message.reply_text("❌ Transaction failed on-chain!", parse_mode="HTML")
+                conn.close()
+                return
+
+            pre_balances = tx_data.pre_balances
+            post_balances = tx_data.post_balances
+            sol_spent = (pre_balances[0] - post_balances[0]) / 1_000_000_000
+
+            if sol_spent < MIN_TRADE_SOL:
+                await update.message.reply_text(
+                    f"❌ Trade size too small! Minimum trade is <b>{MIN_TRADE_SOL} SOL</b>.\n"
+                    f"Your trade: <code>{sol_spent:.3f} SOL</code>.",
+                    parse_mode="HTML"
+                )
+                conn.close()
+                return
+
+            cashback_earned = sol_spent * USER_CASHBACK_PERCENT
+
+            cursor.execute("INSERT INTO processed_txs (tx_hash) VALUES (?)", (tx_hash,))
+            cursor.execute("UPDATE users SET balance_sol = balance_sol + ? WHERE telegram_id = ?", (cashback_earned, user_id))
+            conn.commit()
+
+            await update.message.reply_text(
+                f"🎉 <b>Trade Verified!</b>\n\n"
+                f"🛒 <b>Trade Size:</b> <code>{sol_spent:.3f} SOL</code>\n"
+                f"💰 <b>Cashback Credited:</b> <code>+{cashback_earned:.5f} SOL</code>",
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        logger.error(f"TX verification error: {e}")
+        await update.message.reply_text("⚠️ Invalid hash format or network timeout.", parse_mode="HTML")
+
+    conn.close()
+
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
+    row = cursor.fetchone()
+
+    cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
+    ref_count = cursor.fetchone()[0]
+    conn.close()
+
+    balance = row[0] if row else 0.0
+    wallet = row[1] if row and row[1] else "Not set"
+
+    msg = (
+        "💼 <b>Your Account Summary</b>\n\n"
+        f"💰 <b>Balance:</b> <code>{balance:.5f} SOL</code>\n"
+        f"👥 <b>Total Referrals:</b> <code>{ref_count}</code>\n"
+        f"💳 <b>Payout Wallet:</b> <code>{wallet}</code>\n\n"
+        f"<i>Min Payout: {MIN_WITHDRAW_SOL} SOL | Network Fee: {NETWORK_FEE_SOL} SOL</i>"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    balance = row[0] if row else 0.0
+    wallet = row[1] if row and row[1] else None
+
+    if not wallet:
+        await update.message.reply_text(
+            "⚠️ <b>No payout address linked!</b>\n"
+            "Set your Solana wallet first:\n<code>/wallet YOUR_SOLANA_WALLET_ADDRESS</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    if balance < MIN_WITHDRAW_SOL:
+        await update.message.reply_text(
+            f"❌ <b>Insufficient Balance!</b>\n\n"
+            f"• Your Balance: <code>{balance:.5f} SOL</code>\n"
+            f"• Minimum Required: <code>{MIN_WITHDRAW_SOL} SOL</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    net_payout = balance - NETWORK_FEE_SOL
+    msg = (
+        "✅ <b>Withdrawal Request Logged!</b>\n\n"
+        f"💳 <b>Destination Wallet:</b> <code>{wallet}</code>\n"
+        f"💰 <b>Requested:</b> <code>{balance:.5f} SOL</code>\n"
+        f"⛽ <b>Gas Fee Deduction:</b> <code>-{NETWORK_FEE_SOL} SOL</code>\n"
+        f"💵 <b>Net Transfer:</b> <code>{net_payout:.5f} SOL</code>\n\n"
+        "<i>Payouts process automatically via server batch transfers.</i>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -157,7 +325,7 @@ async def tasks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not completed:
             buttons.append([
                 InlineKeyboardButton("🔗 Open Channel", url=f"https://t.me/{channel.replace('@', '')}"),
-                InlineKeyboardButton("✅ Verify Join", callback_data=f"verify_{task_id}")
+                InlineKeyboardButton("✅ Verify Join", callback_data=f"verifytask_{task_id}")
             ])
         
         reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
@@ -219,41 +387,6 @@ async def verify_task_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     conn.close()
 
 
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
-    row = cursor.fetchone()
-
-    cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
-    ref_count = cursor.fetchone()[0]
-    conn.close()
-
-    balance = row[0] if row else 0.0
-    wallet = row[1] if row and row[1] else "Not set"
-
-    msg = (
-        "💼 <b>Your Account Summary</b>\n\n"
-        f"💰 <b>Balance:</b> <code>{balance:.4f} SOL</code>\n"
-        f"👥 <b>Total Referrals:</b> <code>{ref_count}</code>\n"
-        f"💳 <b>Payout Wallet:</b> <code>{wallet}</code>\n\n"
-        "Use /withdraw to cash out or update your wallet address."
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "💸 <b>Withdraw Earnings</b>\n\n"
-        "To register or update your Solana payout address, reply with your wallet key like this:\n"
-        "<code>/wallet YOUR_SOLANA_WALLET_ADDRESS</code>\n\n"
-        "<i>Minimum payout threshold: 0.01 SOL (3% platform fee applies).</i>"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
 async def set_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     if not context.args:
@@ -272,11 +405,14 @@ async def set_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "❓ <b>Bot Help & Instructions</b>\n\n"
-        "• /tasks - Complete Web3 tasks for rewards\n"
-        "• /balance - View $SOL balance and referrals\n"
-        "• /withdraw - Request cashout or set wallet\n"
-        "• /start - Launch bot and view invite link"
+        "❓ <b>Bot Help & Command Directory</b>\n\n"
+        "• /start - Launch bot & grab your referral link\n"
+        "• /beginner - Plain-English guide on how to trade & earn\n"
+        "• /verify - Submit transaction hash to claim trade cashback\n"
+        "• /tasks - Complete Web3 tasks for instant rewards\n"
+        "• /balance - Check account balance & referral stats\n"
+        "• /wallet - Save or update your Solana payout address\n"
+        "• /withdraw - Request cashout (Min: 0.05 SOL)"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -304,7 +440,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👑 <b>Admin System Dashboard</b>\n\n"
         f"👥 <b>Total Registered Users:</b> <code>{total_users}</code>\n"
         f"✅ <b>Total Tasks Completed:</b> <code>{total_tasks_completed}</code>\n"
-        f"💰 <b>Total User Liability (Owed):</b> <code>{total_user_balances:.4f} SOL</code>\n\n"
+        f"💰 <b>Total User Liability (Owed):</b> <code>{total_user_balances:.5f} SOL</code>\n\n"
         "<b>Commands:</b>\n"
         "• <code>/addtask Title | @ChannelUsername | RewardSOL</code>\n"
         "• <code>/deltask TASK_ID</code>"
@@ -321,8 +457,7 @@ async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_text = " ".join(context.args)
     if not raw_text or "|" not in raw_text:
         await update.message.reply_text(
-            "⚠️ <b>Format:</b>\n<code>/addtask Title | @ChannelUsername | RewardSOL</code>\n\n"
-            "<b>Example:</b>\n<code>/addtask Join Alpha Group | @alphachannel | 0.002</code>",
+            "⚠️ <b>Format:</b>\n<code>/addtask Title | @ChannelUsername | RewardSOL</code>",
             parse_mode="HTML"
         )
         return
@@ -340,13 +475,7 @@ async def addtask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
 
-        await update.message.reply_text(
-            f"✅ <b>Task Added Successfully!</b>\n\n"
-            f"📌 <b>Title:</b> {title}\n"
-            f"📢 <b>Channel:</b> {channel}\n"
-            f"💰 <b>Reward:</b> {reward_sol} SOL",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text(f"✅ <b>Task Added!</b> {title} ({reward_sol} SOL)", parse_mode="HTML")
     except Exception as e:
         await update.message.reply_text(f"❌ Error adding task: {e}")
 
@@ -358,37 +487,18 @@ async def deltask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(
-            "⚠️ <b>Format:</b>\n<code>/deltask TASK_ID</code>\n\n"
-            "<b>Example:</b>\n<code>/deltask 1</code>",
-            parse_mode="HTML"
-        )
+        await update.message.reply_text("⚠️ <b>Format:</b> <code>/deltask TASK_ID</code>", parse_mode="HTML")
         return
 
     task_id = int(context.args[0])
-
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-
-    cursor.execute("SELECT title FROM tasks WHERE id = ?", (task_id,))
-    task = cursor.fetchone()
-
-    if not task:
-        await update.message.reply_text(f"❌ Task ID <code>{task_id}</code> not found.", parse_mode="HTML")
-        conn.close()
-        return
-
     cursor.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
     cursor.execute("DELETE FROM user_tasks WHERE task_id = ?", (task_id,))
     conn.commit()
     conn.close()
 
-    await update.message.reply_text(
-        f"🗑️ <b>Task Removed Successfully!</b>\n\n"
-        f"📌 <b>Task ID:</b> <code>{task_id}</code>\n"
-        f"📝 <b>Title:</b> {task[0]}",
-        parse_mode="HTML"
-    )
+    await update.message.reply_text(f"🗑️ <b>Task {task_id} Removed!</b>", parse_mode="HTML")
 
 
 # ==========================================
@@ -399,7 +509,6 @@ class SolanaBuyTracker:
         self.app = application
         self.chat_id = chat_id
         self.last_buy_count: Optional[int] = None
-        self.last_price: Optional[float] = None
 
     async def fetch_dexscreener(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
         try:
@@ -426,10 +535,10 @@ class SolanaBuyTracker:
     async def run(self):
         if SEND_STARTUP_TEST_MESSAGE:
             try:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token on Trojan", url=REFERRAL_URL)]])
                 await self.app.bot.send_message(
                     chat_id=self.chat_id,
-                    text="🧪 <b>Bot connected with Task & Referral System!</b>",
+                    text="🧪 <b>Alpha Buy Tracker Engine Online!</b>",
                     parse_mode="HTML",
                     reply_markup=reply_markup
                 )
@@ -449,14 +558,16 @@ class SolanaBuyTracker:
                             if new_buys >= MIN_NEW_BUYS_TO_ALERT:
                                 formatted_price = f"${data['price']:,.8f}" if data['price'] < 1 else f"${data['price']:,.2f}"
                                 msg = (
-                                    f"🚨 <b>NEW BUY ACTIVITY DETECTED!</b> 🚨\n\n"
+                                    f"🚨 <b>NEW BUY MOMENTUM DETECTED!</b> 🚨\n\n"
                                     f"🪙 <b>Token:</b> {data['name']} (${data['symbol']})\n"
                                     f"🛒 <b>New Buys:</b> <code>{new_buys}</code>\n"
                                     f"🏷 <b>Price:</b> {formatted_price}\n"
                                     f"📊 <b>Market Cap:</b> ${data['mcap']:,.0f}\n\n"
+                                    f"💡 <b>Trade via Trojan to earn $SOL cashback!</b>\n"
+                                    f"<i>After trading, submit your TX hash with /verify to claim rewards.</i>\n\n"
                                     f"📈 <a href='{data['url']}'>View Chart</a>"
                                 )
-                                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token", url=REFERRAL_URL)]])
+                                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy $SOL on Trojan", url=REFERRAL_URL)]])
                                 await self.app.bot.send_message(
                                     chat_id=self.chat_id, text=msg, parse_mode="HTML", reply_markup=reply_markup
                                 )
@@ -477,16 +588,18 @@ async def handle_health_check(request):
 async def main():
     app_telegram = Application.builder().token(BOT_TOKEN).build()
 
-    # Register User Command Handlers
+    # User Commands
     app_telegram.add_handler(CommandHandler("start", start_command))
+    app_telegram.add_handler(CommandHandler("beginner", beginner_command))
+    app_telegram.add_handler(CommandHandler("verify", verify_tx_command))
     app_telegram.add_handler(CommandHandler("tasks", tasks_command))
     app_telegram.add_handler(CommandHandler("balance", balance_command))
     app_telegram.add_handler(CommandHandler("withdraw", withdraw_command))
     app_telegram.add_handler(CommandHandler("wallet", set_wallet_command))
     app_telegram.add_handler(CommandHandler("help", help_command))
-    app_telegram.add_handler(CallbackQueryHandler(verify_task_callback, pattern="^verify_"))
+    app_telegram.add_handler(CallbackQueryHandler(verify_task_callback, pattern="^verifytask_"))
 
-    # Register Admin Command Handlers
+    # Admin Commands
     app_telegram.add_handler(CommandHandler("admin", admin_command))
     app_telegram.add_handler(CommandHandler("addtask", addtask_command))
     app_telegram.add_handler(CommandHandler("deltask", deltask_command))
@@ -495,7 +608,7 @@ async def main():
     await app_telegram.start()
     await app_telegram.updater.start_polling()
 
-    # Web Server for Hosting Health Checks
+    # Health Check Web Server
     web_app = web.Application()
     web_app.router.add_get("/", handle_health_check)
     runner = web.AppRunner(web_app)
@@ -504,7 +617,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    # Run Background Tracker
+    # Tracker Loop
     tracker = SolanaBuyTracker(app_telegram, CHAT_ID)
     await tracker.run()
 
@@ -512,4 +625,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot manually stopped.")
+        logger.info("Bot stopped.")
