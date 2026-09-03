@@ -1,420 +1,425 @@
 import asyncio
 import logging
 import os
+import re
 import sqlite3
-from typing import Optional, Dict, Any
+import time
+from typing import Optional, Dict, Any, List
+
 import aiohttp
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
-from solana.rpc.async_api import AsyncClient
-from solders.keypair import Keypair
-from solders.pubkey import Pubkey
-from solders.signature import Signature
-from solders.system_program import transfer, TransferParams
-from solders.transaction import VersionedTransaction
-from solders.message import MessageV0
 
 # ==========================================
-# CONFIGURATION & FINANCIAL RULES
+# CONFIGURATION
 # ==========================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8803027756:AAHN1gHf2AmvjKgvJM71y1E-TtGHPO5fqcE")
-CHAT_ID = os.environ.get("CHAT_ID", "-1004364300853")
-MASTER_WALLET_PRIVATE_KEY = os.environ.get("MASTER_WALLET_PRIVATE_KEY")
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN")  # set this in your env, never hardcode
 CHAIN_ID = "solana"
-PAIR_ADDRESS = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
-MIN_NEW_BUYS_TO_ALERT = 3
 REFERRAL_URL = "https://t.me/solana_trojanbot?start=r-____t0ahgu"
-POLL_INTERVAL = 10
-SEND_STARTUP_TEST_MESSAGE = True
-
-DEXSCREENER_URL = f"https://api.dexscreener.com/latest/dex/pairs/{CHAIN_ID}/{PAIR_ADDRESS}"
+POLL_INTERVAL = 15                 # seconds between watchlist scans
+MIN_NEW_BUYS_TO_ALERT = 3          # h1 buy delta needed to fire a momentum alert
+MIN_LIQUIDITY_USD = 1000           # ignore pairs with less liquidity than this when resolving a token
 DB_FILE = "bot_data.db"
-ADMIN_TELEGRAM_ID = "7983373518"
 
-# Financial Controls
-MIN_TRADE_SOL = 0.1             # Trades below 0.1 SOL earn 0 cashback
-USER_CASHBACK_PERCENT = 0.00125 # 0.125% of trade volume
-MIN_WITHDRAW_SOL = 0.05         # Minimum payout threshold
-NETWORK_FEE_SOL = 0.005         # Network gas fee offset
+DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
+DEXSCREENER_PAIR_URL = "https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair}"
 
-RPC_URL = "https://api.mainnet-beta.solana.com"
+SOLANA_ADDR_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")  # base58, no 0/O/I/l
 
-# ==========================================
-# LOGGING & DATABASE SETUP
-# ==========================================
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger("SolanaBuyTracker")
+logger = logging.getLogger("MemeTrackerBot")
 
+# ==========================================
+# DATABASE
+# ==========================================
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id TEXT PRIMARY KEY,
-            solana_wallet TEXT,
-            balance_sol REAL DEFAULT 0.0,
-            referrer_id TEXT
+        CREATE TABLE IF NOT EXISTS watchlist (
+            chat_id TEXT,
+            token_address TEXT,
+            symbol TEXT,
+            added_at INTEGER,
+            last_buy_h1 INTEGER,
+            last_price REAL,
+            PRIMARY KEY (chat_id, token_address)
         )
     """)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
+        CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            channel_username TEXT,
-            reward_sol REAL
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS user_tasks (
             user_id TEXT,
-            task_id INTEGER,
-            PRIMARY KEY (user_id, task_id)
+            token_address TEXT,
+            symbol TEXT,
+            entry_price REAL,
+            size_sol REAL,
+            opened_at INTEGER,
+            closed INTEGER DEFAULT 0,
+            exit_price REAL,
+            closed_at INTEGER
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS processed_txs (
-            tx_hash TEXT PRIMARY KEY
-        )
-    """)
-    
-    cursor.execute("SELECT COUNT(*) FROM tasks")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute(
-            "INSERT INTO tasks (title, channel_username, reward_sol) VALUES (?, ?, ?)",
-            ("Join Official Updates Channel", "@Telegram", 0.001)
-        )
     conn.commit()
     conn.close()
 
 init_db()
 
-# ==========================================
-# ON-CHAIN PAYOUT ENGINE
-# ==========================================
-def load_master_keypair(key_str: str) -> Keypair:
-    if key_str.startswith("["):
-        import json
-        return Keypair.from_bytes(bytes(json.loads(key_str)))
-    return Keypair.from_base58_string(key_str)
-
-async def execute_sol_payout(user_wallet_address: str, payout_sol_amount: float) -> str:
-    if not MASTER_WALLET_PRIVATE_KEY:
-        raise ValueError("MASTER_WALLET_PRIVATE_KEY environment variable is not set.")
-
-    master_keypair = load_master_keypair(MASTER_WALLET_PRIVATE_KEY)
-    recipient_pubkey = Pubkey.from_string(user_wallet_address)
-    lamports_to_send = int(payout_sol_amount * 1_000_000_000)
-
-    async with AsyncClient(RPC_URL) as client:
-        blockhash_resp = await client.get_latest_blockhash()
-        blockhash = blockhash_resp.value.blockhash
-
-        transfer_ix = transfer(
-            TransferParams(
-                from_pubkey=master_keypair.pubkey(),
-                to_pubkey=recipient_pubkey,
-                lamports=lamports_to_send
-            )
-        )
-
-        message = MessageV0.try_compile(
-            payer=master_keypair.pubkey(),
-            instructions=[transfer_ix],
-            address_lookup_table_accounts=[],
-            recent_blockhash=blockhash
-        )
-
-        tx = VersionedTransaction(message, [master_keypair])
-        res = await client.send_transaction(tx)
-        return str(res.value)
+def db():
+    return sqlite3.connect(DB_FILE)
 
 # ==========================================
-# USER COMMAND HANDLERS
+# DEXSCREENER HELPERS
+# ==========================================
+async def fetch_json(session: aiohttp.ClientSession, url: str) -> Optional[dict]:
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        logger.error(f"Fetch error {url}: {e}")
+    return None
+
+def pick_best_pair(pairs: List[dict]) -> Optional[dict]:
+    """Pick the Solana pair with the highest liquidity from a list."""
+    sol_pairs = [p for p in pairs if p.get("chainId") == CHAIN_ID]
+    if not sol_pairs:
+        return None
+    sol_pairs.sort(key=lambda p: (p.get("liquidity") or {}).get("usd", 0) or 0, reverse=True)
+    return sol_pairs[0]
+
+async def resolve_pair(session: aiohttp.ClientSession, address: str) -> Optional[dict]:
+    """Accepts either a token mint address or a pair address, returns the best matching pair dict."""
+    data = await fetch_json(session, DEXSCREENER_TOKEN_URL.format(address=address))
+    if data and data.get("pairs"):
+        best = pick_best_pair(data["pairs"])
+        if best:
+            return best
+
+    data = await fetch_json(session, DEXSCREENER_PAIR_URL.format(chain=CHAIN_ID, pair=address))
+    if data and data.get("pairs"):
+        return data["pairs"][0]
+
+    return None
+
+def extract_stats(p: dict) -> Dict[str, Any]:
+    txns_h1 = (p.get("txns") or {}).get("h1", {}) or {}
+    txns_h24 = (p.get("txns") or {}).get("h24", {}) or {}
+    change = p.get("priceChange") or {}
+    return {
+        "name": (p.get("baseToken") or {}).get("name", "Unknown"),
+        "symbol": (p.get("baseToken") or {}).get("symbol", "TOKEN"),
+        "address": (p.get("baseToken") or {}).get("address", ""),
+        "price": float(p.get("priceUsd") or 0.0),
+        "mcap": p.get("marketCap") or p.get("fdv") or 0.0,
+        "liquidity": (p.get("liquidity") or {}).get("usd", 0.0),
+        "volume_h24": (p.get("volume") or {}).get("h24", 0.0),
+        "buys_h1": int(txns_h1.get("buys") or 0),
+        "sells_h1": int(txns_h1.get("sells") or 0),
+        "buys_h24": int(txns_h24.get("buys") or 0),
+        "sells_h24": int(txns_h24.get("sells") or 0),
+        "chg_m5": change.get("m5", 0.0),
+        "chg_h1": change.get("h1", 0.0),
+        "chg_h6": change.get("h6", 0.0),
+        "chg_h24": change.get("h24", 0.0),
+        "pair_created_at": p.get("pairCreatedAt"),
+        "dex": p.get("dexId", "unknown"),
+        "url": p.get("url", ""),
+    }
+
+def format_price(price: float) -> str:
+    return f"${price:,.8f}" if price < 1 else f"${price:,.4f}"
+
+def format_age(created_ms: Optional[int]) -> str:
+    if not created_ms:
+        return "unknown"
+    seconds = time.time() - created_ms / 1000
+    days = int(seconds // 86400)
+    hours = int((seconds % 86400) // 3600)
+    if days > 0:
+        return f"{days}d {hours}h"
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+def build_insight_message(s: Dict[str, Any]) -> str:
+    ratio_h1 = f"{s['buys_h1']}/{s['sells_h1']}"
+    ratio_h24 = f"{s['buys_h24']}/{s['sells_h24']}"
+    return (
+        f"🔎 <b>{s['name']} (${s['symbol']})</b>\n\n"
+        f"🏷 <b>Price:</b> {format_price(s['price'])}\n"
+        f"📊 <b>Change:</b> 5m {s['chg_m5']}% | 1h {s['chg_h1']}% | 6h {s['chg_h6']}% | 24h {s['chg_h24']}%\n"
+        f"💧 <b>Liquidity:</b> ${s['liquidity']:,.0f}\n"
+        f"🧢 <b>Market Cap:</b> ${s['mcap']:,.0f}\n"
+        f"💵 <b>24h Volume:</b> ${s['volume_h24']:,.0f}\n"
+        f"🛒 <b>Buys/Sells (1h):</b> {ratio_h1}\n"
+        f"🛒 <b>Buys/Sells (24h):</b> {ratio_h24}\n"
+        f"⏳ <b>Pair Age:</b> {format_age(s['pair_created_at'])}\n"
+        f"🔀 <b>DEX:</b> {s['dex']}\n\n"
+        f"📈 <a href='{s['url']}'>View Chart</a>"
+    )
+
+# ==========================================
+# COMMAND HANDLERS
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = str(user.id)
-    referrer_id = context.args[0] if context.args else None
-
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT telegram_id FROM users WHERE telegram_id = ?", (user_id,))
-    if not cursor.fetchone():
-        valid_ref = referrer_id if referrer_id and referrer_id != user_id else None
-        cursor.execute("INSERT INTO users (telegram_id, referrer_id) VALUES (?, ?)", (user_id, valid_ref))
-        conn.commit()
-    conn.close()
-
-    bot_info = await context.bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
-
-    msg = (
-        f"👋 <b>Welcome {user.first_name}!</b>\n\n"
-        "💰 <b>Earn $SOL Cashback:</b> Trade Solana tokens via Trojan & claim rewards!\n"
-        "📋 <b>Web3 Tasks:</b> Complete quick channel tasks for bonus earnings.\n"
-        "📊 <b>Buy Alerts:</b> Real-time whale and momentum signals in chat.\n\n"
-        f"🔗 <b>Your Invite Link:</b>\n<code>{ref_link}</code>\n\n"
-        "<i>Earn 10% bonus whenever your referrals complete tasks!</i>"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def beginner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "👋 <b>New to Solana Trading?</b>\n\n"
-        "1️⃣ <b>Get Your Trojan Wallet:</b>\n"
-        f"   • Tap <a href='{REFERRAL_URL}'>Launch Trojan Bot</a> to open your wallet.\n\n"
-        "2️⃣ <b>Deposit Solana:</b>\n"
-        "   • Send SOL (e.g., 0.2 SOL) to your Trojan wallet address.\n\n"
-        "3️⃣ <b>Trade & Claim Cashback:</b>\n"
-        "   • Tap <b>⚡ Buy on Trojan</b> on buy alerts to trade.\n"
-        "   • Send <code>/verify YOUR_TX_HASH</code> here to claim your cashback!"
-    )
-    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Open Trojan Wallet", url=REFERRAL_URL)]])
-    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
-
-async def verify_tx_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    if not context.args:
-        await update.message.reply_text("⚠️ <b>Format:</b> <code>/verify YOUR_SOLANA_TX_HASH</code>", parse_mode="HTML")
-        return
-
-    tx_hash = context.args[0].strip()
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT 1 FROM processed_txs WHERE tx_hash = ?", (tx_hash,))
-    if cursor.fetchone():
-        await update.message.reply_text("❌ Transaction hash already claimed!", parse_mode="HTML")
-        conn.close()
-        return
-
-    try:
-        async with AsyncClient(RPC_URL) as client:
-            sig = Signature.from_string(tx_hash)
-            resp = await client.get_transaction(sig, encoding="jsonParsed", max_supported_transaction_version=0)
-
-            if not resp.value or resp.value.transaction.meta.err is not None:
-                await update.message.reply_text("❌ Transaction not found or failed on-chain.", parse_mode="HTML")
-                conn.close()
-                return
-
-            tx_meta = resp.value.transaction.meta
-            sol_spent = (tx_meta.pre_balances[0] - tx_meta.post_balances[0]) / 1_000_000_000
-
-            if sol_spent < MIN_TRADE_SOL:
-                await update.message.reply_text(
-                    f"❌ Minimum trade for cashback is <b>{MIN_TRADE_SOL} SOL</b>.\nYour trade: <code>{sol_spent:.3f} SOL</code>.",
-                    parse_mode="HTML"
-                )
-                conn.close()
-                return
-
-            cashback = sol_spent * USER_CASHBACK_PERCENT
-            cursor.execute("INSERT INTO processed_txs (tx_hash) VALUES (?)", (tx_hash,))
-            cursor.execute("UPDATE users SET balance_sol = balance_sol + ? WHERE telegram_id = ?", (cashback, user_id))
-            conn.commit()
-
-            await update.message.reply_text(
-                f"🎉 <b>Trade Verified!</b>\n\n🛒 Trade Size: <code>{sol_spent:.3f} SOL</code>\n💰 Cashback: <code>+{cashback:.5f} SOL</code>",
-                parse_mode="HTML"
-            )
-    except Exception as e:
-        logger.error(f"Verification error: {e}")
-        await update.message.reply_text("⚠️ Invalid transaction hash format or network timeout.", parse_mode="HTML")
-
-    conn.close()
-
-async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
-    row = cursor.fetchone()
-    cursor.execute("SELECT COUNT(*) FROM users WHERE referrer_id = ?", (user_id,))
-    ref_count = cursor.fetchone()[0]
-    conn.close()
-
-    balance = row[0] if row else 0.0
-    wallet = row[1] if row and row[1] else "Not set"
-
-    msg = (
-        "💼 <b>Your Account Summary</b>\n\n"
-        f"💰 <b>Balance:</b> <code>{balance:.5f} SOL</code>\n"
-        f"👥 <b>Total Referrals:</b> <code>{ref_count}</code>\n"
-        f"💳 <b>Payout Wallet:</b> <code>{wallet}</code>\n\n"
-        f"<i>Min Withdrawal: {MIN_WITHDRAW_SOL} SOL | Gas Fee Deduction: {NETWORK_FEE_SOL} SOL</i>"
-    )
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-async def withdraw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT balance_sol, solana_wallet FROM users WHERE telegram_id = ?", (user_id,))
-    row = cursor.fetchone()
-
-    balance = row[0] if row else 0.0
-    wallet = row[1] if row and row[1] else None
-
-    if not wallet:
-        await update.message.reply_text("⚠️ Please set a payout wallet first using <code>/wallet YOUR_ADDRESS</code>", parse_mode="HTML")
-        conn.close()
-        return
-
-    if balance < MIN_WITHDRAW_SOL:
-        await update.message.reply_text(f"❌ Minimum cashout requirement is <b>{MIN_WITHDRAW_SOL} SOL</b>. Current balance: <code>{balance:.5f} SOL</code>.", parse_mode="HTML")
-        conn.close()
-        return
-
-    net_payout = balance - NETWORK_FEE_SOL
-
-    try:
-        tx_sig = await execute_sol_payout(wallet, net_payout)
-        cursor.execute("UPDATE users SET balance_sol = 0.0 WHERE telegram_id = ?", (user_id,))
-        conn.commit()
-
+    is_dm = update.effective_chat.type == "private"
+    if is_dm:
         msg = (
-            "💸 <b>Payout Sent Successfully!</b>\n\n"
-            f"💳 <b>Recipient:</b> <code>{wallet}</code>\n"
-            f"💵 <b>Amount Transferred:</b> <code>{net_payout:.5f} SOL</code>\n"
-            f"⛽ <b>Gas Fee Offset:</b> <code>{NETWORK_FEE_SOL} SOL</code>\n\n"
-            f"🔗 <a href='https://solscan.io/tx/{tx_sig}'>View Solscan Transaction</a>"
+            "👋 <b>Meme Coin Tracker</b>\n\n"
+            "Paste any Solana token or pair address here and I'll pull instant insights — "
+            "price, liquidity, market cap, volume, buy/sell ratio, and pair age.\n\n"
+            "<b>Other commands:</b>\n"
+            "• /token <code>&lt;address&gt;</code> — manual lookup\n"
+            "• /watch <code>&lt;address&gt;</code> — get momentum alerts here\n"
+            "• /unwatch <code>&lt;address&gt;</code>\n"
+            "• /watchlist — see what you're tracking\n"
+            "• /logtrade <code>&lt;address&gt; &lt;entry_price&gt; &lt;size_sol&gt;</code>\n"
+            "• /pnl — your open/closed positions"
         )
-        await update.message.reply_text(msg, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Payout failed: {e}")
-        await update.message.reply_text("⚠️ Payout failed. Ensure master server wallet has sufficient SOL for transfers.", parse_mode="HTML")
+    else:
+        msg = (
+            "👋 <b>Meme Coin Tracker is live in this group.</b>\n\n"
+            "Use /watch <code>&lt;address&gt;</code> to add a token — I'll post buy-momentum "
+            "alerts here automatically. Use /token <code>&lt;address&gt;</code> for an on-demand snapshot."
+        )
+    await update.message.reply_text(msg, parse_mode="HTML")
 
-    conn.close()
-
-async def set_wallet_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
+async def token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("⚠️ Provide a wallet address: <code>/wallet YOUR_SOLANA_WALLET</code>", parse_mode="HTML")
+        await update.message.reply_text("⚠️ Usage: <code>/token &lt;address&gt;</code>", parse_mode="HTML")
+        return
+    await lookup_and_reply(update, context.args[0].strip())
+
+async def lookup_and_reply(update: Update, address: str):
+    async with aiohttp.ClientSession() as session:
+        pair = await resolve_pair(session, address)
+    if not pair:
+        await update.message.reply_text("❌ Couldn't find that token/pair on DexScreener.", parse_mode="HTML")
+        return
+    stats = extract_stats(pair)
+    reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade on Trojan", url=REFERRAL_URL)]])
+    await update.message.reply_text(build_insight_message(stats), parse_mode="HTML", reply_markup=reply_markup, disable_web_page_preview=False)
+
+async def dm_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-detect a pasted Solana address in a DM and run a lookup."""
+    if update.effective_chat.type != "private":
+        return
+    text = (update.message.text or "").strip()
+    if SOLANA_ADDR_RE.match(text):
+        await lookup_and_reply(update, text)
+
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/watch &lt;address&gt;</code>", parse_mode="HTML")
+        return
+    address = context.args[0].strip()
+    chat_id = str(update.effective_chat.id)
+
+    async with aiohttp.ClientSession() as session:
+        pair = await resolve_pair(session, address)
+    if not pair:
+        await update.message.reply_text("❌ Couldn't find that token/pair on DexScreener.", parse_mode="HTML")
         return
 
-    wallet = context.args[0].strip()
-    conn = sqlite3.connect(DB_FILE)
+    stats = extract_stats(pair)
+    conn = db()
     cursor = conn.cursor()
-    cursor.execute("UPDATE users SET solana_wallet = ? WHERE telegram_id = ?", (wallet, user_id))
+    cursor.execute(
+        "INSERT OR REPLACE INTO watchlist (chat_id, token_address, symbol, added_at, last_buy_h1, last_price) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (chat_id, stats["address"] or address, stats["symbol"], int(time.time()), stats["buys_h1"], stats["price"]),
+    )
     conn.commit()
     conn.close()
-    await update.message.reply_text(f"✅ Solana payout wallet saved:\n<code>{wallet}</code>", parse_mode="HTML")
+    await update.message.reply_text(
+        f"✅ Now watching <b>${stats['symbol']}</b> in this chat. I'll alert on buy momentum here.",
+        parse_mode="HTML",
+    )
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: <code>/unwatch &lt;address&gt;</code>", parse_mode="HTML")
+        return
+    address = context.args[0].strip()
+    chat_id = str(update.effective_chat.id)
+    conn = db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM watchlist WHERE chat_id = ? AND token_address = ?", (chat_id, address))
+    conn.commit()
+    conn.close()
+    await update.message.reply_text("🗑 Removed from watchlist (if it was there).")
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    conn = db()
+    cursor = conn.cursor()
+    cursor.execute("SELECT symbol, token_address FROM watchlist WHERE chat_id = ?", (chat_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("📭 Nothing watched in this chat yet. Use /watch <address>.")
+        return
+    lines = "\n".join(f"• ${sym} — <code>{addr}</code>" for sym, addr in rows)
+    await update.message.reply_text(f"👀 <b>Watchlist:</b>\n{lines}", parse_mode="HTML")
+
+async def logtrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "⚠️ Usage: <code>/logtrade &lt;address&gt; &lt;entry_price&gt; &lt;size_sol&gt;</code>", parse_mode="HTML"
+        )
+        return
+    address, entry_price_s, size_s = context.args[0], context.args[1], context.args[2]
+    try:
+        entry_price = float(entry_price_s)
+        size_sol = float(size_s)
+    except ValueError:
+        await update.message.reply_text("❌ Entry price and size must be numbers.")
+        return
+
+    async with aiohttp.ClientSession() as session:
+        pair = await resolve_pair(session, address)
+    symbol = extract_stats(pair)["symbol"] if pair else "UNKNOWN"
+
+    conn = db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO trades (user_id, token_address, symbol, entry_price, size_sol, opened_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (str(update.effective_user.id), address, symbol, entry_price, size_sol, int(time.time())),
+    )
+    conn.commit()
+    conn.close()
+    await update.message.reply_text(f"📝 Logged: {size_sol} SOL into ${symbol} @ {format_price(entry_price)}", parse_mode="HTML")
+
+async def pnl_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    conn = db()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT symbol, token_address, entry_price, size_sol, closed, exit_price FROM trades WHERE user_id = ? ORDER BY opened_at DESC LIMIT 15",
+        (user_id,),
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("📭 No trades logged yet. Use /logtrade to start tracking.")
+        return
+
+    lines = []
+    async with aiohttp.ClientSession() as session:
+        for symbol, address, entry_price, size_sol, closed, exit_price in rows:
+            if closed:
+                pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price else 0
+                lines.append(f"✅ ${symbol}: {pct:+.1f}% (closed)")
+            else:
+                pair = await resolve_pair(session, address)
+                if pair:
+                    current = extract_stats(pair)["price"]
+                    pct = ((current - entry_price) / entry_price) * 100 if entry_price else 0
+                    lines.append(f"🟢 ${symbol}: {pct:+.1f}% (open, {size_sol} SOL in)")
+                else:
+                    lines.append(f"🟡 ${symbol}: price unavailable (open)")
+
+    await update.message.reply_text("📈 <b>Your Positions</b>\n\n" + "\n".join(lines), parse_mode="HTML")
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "❓ <b>Bot Command Directory</b>\n\n"
-        "• /start - Launch bot & grab invite link\n"
-        "• /beginner - Plain-English guide on trading & cashback\n"
-        "• /verify - Submit transaction hash for cashback\n"
-        "• /tasks - Complete Web3 tasks for SOL rewards\n"
-        "• /balance - Check balance & referral stats\n"
-        "• /wallet - Set payout wallet\n"
-        "• /withdraw - Cashout SOL to wallet"
+        "❓ <b>Commands</b>\n\n"
+        "• /token <code>&lt;address&gt;</code> — instant snapshot\n"
+        "• /watch <code>&lt;address&gt;</code> — track for momentum alerts\n"
+        "• /unwatch <code>&lt;address&gt;</code>\n"
+        "• /watchlist — list tracked tokens here\n"
+        "• /logtrade <code>&lt;address&gt; &lt;entry&gt; &lt;size_sol&gt;</code> — log a trade\n"
+        "• /pnl — your positions and live P&L\n\n"
+        "<i>In DMs, just paste an address — no command needed.</i>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
 
 # ==========================================
-# BUY TRACKER LOOP
+# MOMENTUM ALERT LOOP (all watched tokens, all chats)
 # ==========================================
-class SolanaBuyTracker:
-    def __init__(self, application: Application, chat_id: str):
+class WatchlistTracker:
+    def __init__(self, application: Application):
         self.app = application
-        self.chat_id = chat_id
-        self.last_buy_count: Optional[int] = None
 
-    async def fetch_dexscreener(self, session: aiohttp.ClientSession) -> Optional[Dict[str, Any]]:
-        try:
-            async with session.get(DEXSCREENER_URL, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    pairs = data.get("pairs")
-                    if not pairs:
-                        return None
-                    p = pairs[0]
-                    txns_h1 = p.get("txns", {}).get("h1", {}) or {}
-                    return {
-                        "name": p.get("baseToken", {}).get("name", "Unknown"),
-                        "symbol": p.get("baseToken", {}).get("symbol", "TOKEN"),
-                        "price": float(p.get("priceUsd") or 0.0),
-                        "mcap": p.get("marketCap") or p.get("fdv") or 0.0,
-                        "buys_h1": int(txns_h1.get("buys") or 0),
-                        "url": p.get("url", f"https://dexscreener.com/{CHAIN_ID}/{PAIR_ADDRESS}"),
-                    }
-        except Exception as e:
-            logger.error(f"DexScreener error: {e}")
-        return None
+    async def scan_once(self, session: aiohttp.ClientSession):
+        conn = db()
+        cursor = conn.cursor()
+        cursor.execute("SELECT chat_id, token_address, symbol, last_buy_h1 FROM watchlist")
+        rows = cursor.fetchall()
+        conn.close()
+
+        # cache lookups per token address so multiple chats watching the same token = 1 API call
+        cache: Dict[str, Optional[dict]] = {}
+        for chat_id, token_address, symbol, last_buy_h1 in rows:
+            if token_address not in cache:
+                cache[token_address] = await resolve_pair(session, token_address)
+            pair = cache[token_address]
+            if not pair:
+                continue
+            stats = extract_stats(pair)
+            new_buys = stats["buys_h1"] - (last_buy_h1 or 0)
+
+            conn = db()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE watchlist SET last_buy_h1 = ?, last_price = ? WHERE chat_id = ? AND token_address = ?",
+                (stats["buys_h1"], stats["price"], chat_id, token_address),
+            )
+            conn.commit()
+            conn.close()
+
+            if last_buy_h1 is not None and new_buys >= MIN_NEW_BUYS_TO_ALERT:
+                msg = (
+                    f"🚨 <b>BUY MOMENTUM: ${stats['symbol']}</b> 🚨\n\n"
+                    f"🛒 <b>New buys (1h window):</b> +{new_buys}\n"
+                    f"🏷 <b>Price:</b> {format_price(stats['price'])} ({stats['chg_h1']:+.1f}% 1h)\n"
+                    f"🧢 <b>Market Cap:</b> ${stats['mcap']:,.0f}\n"
+                    f"💧 <b>Liquidity:</b> ${stats['liquidity']:,.0f}\n\n"
+                    f"📈 <a href='{stats['url']}'>View Chart</a>"
+                )
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade on Trojan", url=REFERRAL_URL)]])
+                try:
+                    await self.app.bot.send_message(chat_id=chat_id, text=msg, parse_mode="HTML", reply_markup=reply_markup)
+                except Exception as e:
+                    logger.error(f"Failed to alert chat {chat_id}: {e}")
 
     async def run(self):
-        if SEND_STARTUP_TEST_MESSAGE:
-            try:
-                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Trade Token on Trojan", url=REFERRAL_URL)]])
-                await self.app.bot.send_message(
-                    chat_id=self.chat_id,
-                    text="🧪 <b>Buy Tracker Engine Connected & Online!</b>",
-                    parse_mode="HTML",
-                    reply_markup=reply_markup
-                )
-            except Exception as e:
-                logger.error(f"Startup test failed: {e}")
-
         async with aiohttp.ClientSession() as session:
             while True:
                 try:
-                    data = await self.fetch_dexscreener(session)
-                    if data:
-                        buys_h1 = data["buys_h1"]
-                        if self.last_buy_count is None:
-                            self.last_buy_count = buys_h1
-                        else:
-                            new_buys = buys_h1 - self.last_buy_count
-                            if new_buys >= MIN_NEW_BUYS_TO_ALERT:
-                                formatted_price = f"${data['price']:,.8f}" if data['price'] < 1 else f"${data['price']:,.2f}"
-                                msg = (
-                                    f"🚨 <b>NEW BUY MOMENTUM DETECTED!</b> 🚨\n\n"
-                                    f"🪙 <b>Token:</b> {data['name']} (${data['symbol']})\n"
-                                    f"🛒 <b>New Buys:</b> <code>{new_buys}</code>\n"
-                                    f"🏷 <b>Price:</b> {formatted_price}\n"
-                                    f"📊 <b>Market Cap:</b> ${data['mcap']:,.0f}\n\n"
-                                    f"💡 <b>Trade via Trojan to earn $SOL cashback!</b>\n"
-                                    f"<i>After trading, submit your TX hash with /verify to claim rewards.</i>\n\n"
-                                    f"📈 <a href='{data['url']}'>View Chart</a>"
-                                )
-                                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Buy $SOL on Trojan", url=REFERRAL_URL)]])
-                                await self.app.bot.send_message(
-                                    chat_id=self.chat_id, text=msg, parse_mode="HTML", reply_markup=reply_markup
-                                )
-                                self.last_buy_count = buys_h1
-                            elif new_buys < 0:
-                                self.last_buy_count = buys_h1
+                    await self.scan_once(session)
                 except Exception as e:
                     logger.error(f"Tracker loop error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)
 
 # ==========================================
-# MAIN EXECUTION
+# MAIN
 # ==========================================
 async def handle_health_check(request):
     return web.Response(text="Bot is running.")
 
 async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Set the BOT_TOKEN environment variable before running.")
+
     app_telegram = Application.builder().token(BOT_TOKEN).build()
 
     app_telegram.add_handler(CommandHandler("start", start_command))
-    app_telegram.add_handler(CommandHandler("beginner", beginner_command))
-    app_telegram.add_handler(CommandHandler("verify", verify_tx_command))
-    app_telegram.add_handler(CommandHandler("balance", balance_command))
-    app_telegram.add_handler(CommandHandler("withdraw", withdraw_command))
-    app_telegram.add_handler(CommandHandler("wallet", set_wallet_command))
+    app_telegram.add_handler(CommandHandler("token", token_command))
+    app_telegram.add_handler(CommandHandler("watch", watch_command))
+    app_telegram.add_handler(CommandHandler("unwatch", unwatch_command))
+    app_telegram.add_handler(CommandHandler("watchlist", watchlist_command))
+    app_telegram.add_handler(CommandHandler("logtrade", logtrade_command))
+    app_telegram.add_handler(CommandHandler("pnl", pnl_command))
     app_telegram.add_handler(CommandHandler("help", help_command))
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, dm_text_handler))
 
     await app_telegram.initialize()
     await app_telegram.start()
@@ -428,7 +433,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    tracker = SolanaBuyTracker(app_telegram, CHAT_ID)
+    tracker = WatchlistTracker(app_telegram)
     await tracker.run()
 
 if __name__ == "__main__":
