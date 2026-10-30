@@ -1,0 +1,7 @@
+{
+  "actorSpecification": 1,
+  "name": "remote-ok-scraper",
+  "title": "Remote OK Job Scraper",
+  "version": "0.1",
+  "buildTag": "latest"
+}
